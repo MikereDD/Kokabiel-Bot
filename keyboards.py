@@ -5,6 +5,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from credits import TMDB_ATTRIBUTION_URL, TMDB_URL
 from models import MediaDetails, SearchResult
 
+SEARCH_PAGE_SIZE = 6
+
 
 def about_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -20,8 +22,17 @@ def about_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def search_results_keyboard(results: list[SearchResult]) -> InlineKeyboardMarkup:
+def search_results_keyboard(
+    results: list[SearchResult],
+    *,
+    search_token: str,
+    page: int = 0,
+) -> InlineKeyboardMarkup:
     from formatting import selection_label
+
+    start = page * SEARCH_PAGE_SIZE
+    end = start + SEARCH_PAGE_SIZE
+    visible_results = results[start:end]
 
     rows = [
         [
@@ -30,8 +41,27 @@ def search_results_keyboard(results: list[SearchResult]) -> InlineKeyboardMarkup
                 callback_data=f"pick|{item.short_type}|{item.tmdb_id}",
             )
         ]
-        for item in results
+        for item in visible_results
     ]
+
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                "◀ Previous",
+                callback_data=f"page|{search_token}|{page - 1}",
+            )
+        )
+    if end < len(results):
+        navigation.append(
+            InlineKeyboardButton(
+                "More results ▶",
+                callback_data=f"page|{search_token}|{page + 1}",
+            )
+        )
+    if navigation:
+        rows.append(navigation)
+
     return InlineKeyboardMarkup(rows)
 
 

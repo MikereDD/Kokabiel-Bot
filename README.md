@@ -66,7 +66,7 @@ In a private Telegram chat with Kokabiel:
 /movie The Thing
 ```
 
-Choose the correct release with the result buttons, then test Watchlist, Rate, Recommend, `/watchlist`, and `/random`.
+Kokabiel shows six matching titles at a time. Use **More results** or **Previous** to move through longer result lists, then choose the correct release and test Watchlist, Rate, Recommend, `/watchlist`, and `/random`.
 
 ## Commands
 

@@ -15,7 +15,12 @@ from handlers.common import (
     tmdb,
     user_identity,
 )
-from keyboards import media_actions_keyboard, rating_keyboard
+from keyboards import (
+    SEARCH_PAGE_SIZE,
+    media_actions_keyboard,
+    rating_keyboard,
+    search_results_keyboard,
+)
 from models import MediaDetails
 from tmdb import TmdbError
 
@@ -33,6 +38,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if len(parts) == 3 and parts[0] == "pick":
             await _pick(update, context, parts[1], int(parts[2]))
             return
+        if len(parts) == 3 and parts[0] == "page":
+            await _search_page(update, context, parts[1], int(parts[2]))
+            return
         if len(parts) == 4 and parts[0] == "act":
             await _action(update, context, parts[1], parts[2], int(parts[3]))
             return
@@ -45,6 +53,32 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await query.answer("That button is no longer valid.")
+
+
+async def _search_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, search_token: str, page: int
+) -> None:
+    query = update.callback_query
+    search_cache = context.chat_data.get("kokabiel_search_results", {})
+    results = search_cache.get(search_token)
+    if not results:
+        await query.answer(
+            "Those search results expired. Run the command again.",
+            show_alert=True,
+        )
+        return
+
+    page_count = max(1, (len(results) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
+    if page < 0 or page >= page_count:
+        await query.answer("That results page is no longer available.", show_alert=True)
+        return
+
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=search_results_keyboard(
+            results, search_token=search_token, page=page
+        )
+    )
 
 
 async def _pick(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from secrets import token_hex
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -102,10 +103,18 @@ async def _search(
         await update.effective_message.reply_text(f"No matching titles found for “{query}”.")
         return
 
+    search_token = token_hex(4)
+    search_cache = context.chat_data.setdefault("kokabiel_search_results", {})
+    search_cache[search_token] = results
+    while len(search_cache) > 20:
+        search_cache.pop(next(iter(search_cache)))
+
     await update.effective_message.reply_text(
         f"Choose the correct title for <b>{_escape(query)}</b>:",
         parse_mode=ParseMode.HTML,
-        reply_markup=search_results_keyboard(results),
+        reply_markup=search_results_keyboard(
+            results, search_token=search_token, page=0
+        ),
     )
 
 
