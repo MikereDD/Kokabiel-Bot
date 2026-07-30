@@ -65,16 +65,20 @@ def search_results_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def media_actions_keyboard(details: MediaDetails) -> InlineKeyboardMarkup:
+def media_actions_keyboard(
+    details: MediaDetails, *, watchlist: bool = False, watched: bool = False
+) -> InlineKeyboardMarkup:
     short = details.short_type
     tmdb_id = details.tmdb_id
     rows = [
         [
             InlineKeyboardButton(
-                "✅ Mark watched", callback_data=f"act|watched|{short}|{tmdb_id}"
+                "✅ Watched" if watched else "✅ Mark watched",
+                callback_data=f"act|watched|{short}|{tmdb_id}",
             ),
             InlineKeyboardButton(
-                "➕ Watchlist", callback_data=f"act|watchlist|{short}|{tmdb_id}"
+                "✅ In Watchlist" if watchlist else "➕ Watchlist",
+                callback_data=f"act|watchlist|{short}|{tmdb_id}",
             ),
         ],
         [
@@ -114,3 +118,14 @@ def rating_keyboard(details: MediaDetails) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("↩ Back", callback_data=f"act|back|{short}|{tmdb_id}")]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def owner_confirmation_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Cancel", callback_data=f"own|no|{token}"),
+                InlineKeyboardButton("Confirm", callback_data=f"own|ok|{token}"),
+            ]
+        ]
+    )

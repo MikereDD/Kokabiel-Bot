@@ -156,13 +156,17 @@ async def random_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             details.poster_url,
             caption=media_caption(details, group_rating=average, rating_count=count),
             parse_mode=ParseMode.HTML,
-            reply_markup=media_actions_keyboard(details),
+            reply_markup=media_actions_keyboard(
+                details, watchlist=entry.watchlist, watched=entry.watched
+            ),
         )
     else:
         await update.effective_message.reply_text(
             media_caption(details, group_rating=average, rating_count=count),
             parse_mode=ParseMode.HTML,
-            reply_markup=media_actions_keyboard(details),
+            reply_markup=media_actions_keyboard(
+                details, watchlist=entry.watchlist, watched=entry.watched
+            ),
         )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 import aiohttp
 from telegram import BotCommand
@@ -22,6 +23,17 @@ from handlers.commands import (
     watchlist,
 )
 from handlers.errors import error_handler
+from handlers.owner import (
+    adminhelp,
+    groups,
+    leave,
+    leavechat,
+    reload_config,
+    restart,
+    shutdown,
+    status,
+    whoami,
+)
 from logging_setup import configure_logging
 from tmdb import TmdbClient
 
@@ -52,9 +64,13 @@ async def post_init(application: Application) -> None:
         region=settings.region,
         include_adult=settings.include_adult,
     )
+    application.bot_data["started_at"] = datetime.now(timezone.utc)
     await application.bot_data["database"].initialize()
     await application.bot.set_my_commands(COMMANDS)
-    LOGGER.info("Kokabiel initialized")
+    LOGGER.info(
+        "Kokabiel initialized with %s configured owner(s)",
+        len(settings.owner_user_ids),
+    )
 
 
 async def post_shutdown(application: Application) -> None:
@@ -93,6 +109,17 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("watchlist", watchlist))
     application.add_handler(CommandHandler("watched", watched))
     application.add_handler(CommandHandler("random", random_pick))
+
+    application.add_handler(CommandHandler("adminhelp", adminhelp))
+    application.add_handler(CommandHandler("whoami", whoami))
+    application.add_handler(CommandHandler("groups", groups))
+    application.add_handler(CommandHandler("leave", leave))
+    application.add_handler(CommandHandler("leavechat", leavechat))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("reload", reload_config))
+    application.add_handler(CommandHandler("restart", restart))
+    application.add_handler(CommandHandler("shutdown", shutdown))
+
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_error_handler(error_handler)
     return application

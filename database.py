@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-from models import CatalogEntry, MediaDetails, MediaType
+from models import CatalogEntry, KnownChat, MediaDetails, MediaType
 
 T = TypeVar("T")
 
@@ -64,6 +64,19 @@ CREATE TABLE IF NOT EXISTS recommendations (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS known_chats (
+    chat_id INTEGER NOT NULL PRIMARY KEY,
+    chat_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    username TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_known_chats_type_active
+ON known_chats(chat_type, is_active, last_seen_at);
+
 CREATE INDEX IF NOT EXISTS idx_catalog_watchlist
 ON group_catalog(chat_id, watchlist, added_at);
 
@@ -107,6 +120,88 @@ class Database:
     def _run_read_sync(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         with self._connect() as connection:
             return operation(connection)
+
+    async def record_chat(
+        self,
+        chat_id: int,
+        chat_type: str,
+        title: str,
+        username: str | None = None,
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO known_chats (
+                    chat_id, chat_type, title, username, is_active
+                ) VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(chat_id)
+                DO UPDATE SET chat_type = excluded.chat_type,
+                              title = excluded.title,
+                              username = excluded.username,
+                              is_active = 1,
+                              last_seen_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, chat_type, title, username),
+            )
+
+        await self._write(operation)
+
+    async def mark_chat_inactive(self, chat_id: int) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                UPDATE known_chats
+                SET is_active = 0, last_seen_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+
+        await self._write(operation)
+
+    async def list_known_groups(
+        self, *, include_inactive: bool = True
+    ) -> list[KnownChat]:
+        def operation(connection: sqlite3.Connection) -> list[KnownChat]:
+            where = "chat_type IN ('group', 'supergroup')"
+            if not include_inactive:
+                where += " AND is_active = 1"
+            rows = connection.execute(
+                f"""
+                SELECT chat_id, chat_type, title, username, is_active,
+                       first_seen_at, last_seen_at
+                FROM known_chats
+                WHERE {where}
+                ORDER BY is_active DESC, title COLLATE NOCASE, chat_id
+                """
+            ).fetchall()
+            return [
+                KnownChat(
+                    chat_id=int(row["chat_id"]),
+                    chat_type=str(row["chat_type"]),
+                    title=str(row["title"]),
+                    username=row["username"],
+                    is_active=bool(row["is_active"]),
+                    first_seen_at=str(row["first_seen_at"]),
+                    last_seen_at=str(row["last_seen_at"]),
+                )
+                for row in rows
+            ]
+
+        return await self._read(operation)
+
+    async def count_active_groups(self) -> int:
+        def operation(connection: sqlite3.Connection) -> int:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM known_chats
+                WHERE chat_type IN ('group', 'supergroup') AND is_active = 1
+                """
+            ).fetchone()
+            return int(row["count"] if row else 0)
+
+        return await self._read(operation)
 
     async def set_watchlist(
         self,
@@ -202,6 +297,24 @@ class Database:
             return cursor.rowcount > 0
 
         return await self._write(operation)
+
+    async def catalog_state(
+        self, chat_id: int, media_type: MediaType, tmdb_id: int
+    ) -> tuple[bool, bool]:
+        def operation(connection: sqlite3.Connection) -> tuple[bool, bool]:
+            row = connection.execute(
+                """
+                SELECT watchlist, watched
+                FROM group_catalog
+                WHERE chat_id = ? AND media_type = ? AND tmdb_id = ?
+                """,
+                (chat_id, media_type, tmdb_id),
+            ).fetchone()
+            if row is None:
+                return False, False
+            return bool(row["watchlist"]), bool(row["watched"])
+
+        return await self._read(operation)
 
     async def list_entries(
         self, chat_id: int, *, watchlist: bool = False, watched: bool = False, limit: int = 50

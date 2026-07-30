@@ -22,6 +22,12 @@ def configure_logging(log_path: Path, level_name: str) -> None:
 
     root = logging.getLogger()
     root.setLevel(level)
-    root.handlers.clear()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+
+    # httpx logs Telegram Bot API URLs at INFO level, including the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)

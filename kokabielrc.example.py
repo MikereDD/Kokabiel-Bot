@@ -12,7 +12,12 @@ LOG_PATH = KOKABIEL_DIR / "kokabiel.log"
 # Empty allows private testing anywhere the bot is added.
 # Add the group's long negative chat ID when ready to lock it down.
 ALLOWED_CHAT_IDS = []
-ADMIN_USER_IDS = []
+# Only these Telegram user IDs can use Kokabiel owner commands.
+OWNER_USER_IDS = [
+    # 123456789,
+]
+
+# Legacy ADMIN_USER_IDS is still accepted if OWNER_USER_IDS is absent.
 
 LANGUAGE = "en-US"
 REGION = "US"

@@ -46,7 +46,13 @@ chmod 600 "$HOME/bots/config/kokabielrc.py"
 vim "$HOME/bots/config/kokabielrc.py"
 ```
 
-Add the Telegram BotFather token and the TMDB API Read Access Token.
+Add the Telegram BotFather token, TMDB API Read Access Token, and your Telegram user ID:
+
+```python
+OWNER_USER_IDS = [123456789]
+```
+
+Only these IDs can use owner commands. Telegram group administrators do not inherit owner access.
 
 ## Run
 
@@ -79,6 +85,22 @@ Kokabiel shows six matching titles at a time. Use **More results** or **Previous
 - `/random`
 - `/about`
 - `/help`
+
+## Owner commands
+
+Owner commands are checked against `OWNER_USER_IDS` in the private config.
+
+- `/adminhelp`
+- `/whoami`
+- `/groups`
+- `/leave`
+- `/leavechat <chat_id>`
+- `/status`
+- `/reload`
+- `/restart`
+- `/shutdown`
+
+`/leave`, `/leavechat`, `/restart`, and `/shutdown` require confirmation. Sensitive runtime commands must be used in Kokabiel's private chat.
 
 ## TMDB attribution
 

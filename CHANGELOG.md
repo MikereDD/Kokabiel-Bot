@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Owner-only command authorization through `OWNER_USER_IDS`.
+- `/adminhelp`, `/whoami`, `/groups`, `/leave`, `/leavechat`, `/status`, `/reload`, `/restart`, and `/shutdown`.
+- Confirmation buttons for leaving groups, restarting, and shutting down.
+- Known-group tracking with active/left status.
+- Runtime-safe configuration reloads.
+
+### Changed
+
+- Owner callbacks bypass the normal group allowlist while still requiring an owner ID.
+- Logging reconfiguration now closes replaced handlers cleanly.
+
 ## 0.1 — 2026-07-28
 
 ### Added

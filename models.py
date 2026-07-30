@@ -67,3 +67,14 @@ class CatalogEntry:
     recommended_by: tuple[str, ...] = field(default_factory=tuple)
     group_rating: float | None = None
     rating_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class KnownChat:
+    chat_id: int
+    chat_type: str
+    title: str
+    username: str | None
+    is_active: bool
+    first_seen_at: str
+    last_seen_at: str

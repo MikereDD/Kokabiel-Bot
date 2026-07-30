@@ -23,16 +23,24 @@ from keyboards import (
 )
 from models import MediaDetails
 from tmdb import TmdbError
+from handlers.owner import owner_callback_router
 
 LOGGER = logging.getLogger(__name__)
 
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query is None or not await allowed(update, context):
+    if query is None:
         return
 
     data = query.data or ""
+    if data.startswith("own|"):
+        await owner_callback_router(update, context)
+        return
+
+    if not await allowed(update, context):
+        return
+
     parts = data.split("|")
     try:
         if len(parts) == 3 and parts[0] == "pick":
@@ -88,8 +96,10 @@ async def _pick(
     await query.answer()
     media_type = media_type_from_short(short_type)
     details = await tmdb(context).details(media_type, tmdb_id)
-    average, count = await database(context).group_rating(
-        update.effective_chat.id, media_type, tmdb_id
+    chat_id = update.effective_chat.id
+    average, count = await database(context).group_rating(chat_id, media_type, tmdb_id)
+    watchlist, watched = await database(context).catalog_state(
+        chat_id, media_type, tmdb_id
     )
 
     try:
@@ -103,7 +113,9 @@ async def _pick(
     kwargs = {
         "caption": media_caption(details, group_rating=average, rating_count=count),
         "parse_mode": ParseMode.HTML,
-        "reply_markup": media_actions_keyboard(details),
+        "reply_markup": media_actions_keyboard(
+            details, watchlist=watchlist, watched=watched
+        ),
     }
     if details.poster_url:
         await context.bot.send_photo(update.effective_chat.id, details.poster_url, **kwargs)
@@ -129,12 +141,30 @@ async def _action(
     chat_id = update.effective_chat.id
     user_id, user_name = user_identity(update)
 
+    watchlist, watched = await database(context).catalog_state(
+        chat_id, media_type, tmdb_id
+    )
+
     if action == "watchlist":
-        await database(context).set_watchlist(chat_id, details, user_id, user_name)
-        await query.answer("Added to the group watchlist.")
+        enabled = not watchlist
+        await database(context).set_watchlist(
+            chat_id, details, user_id, user_name, enabled=enabled
+        )
+        await query.answer(
+            "Added to the group watchlist."
+            if enabled
+            else "Removed from the group watchlist."
+        )
     elif action == "watched":
-        await database(context).set_watched(chat_id, details, user_id, user_name)
-        await query.answer("Marked as watched by the group.")
+        enabled = not watched
+        await database(context).set_watched(
+            chat_id, details, user_id, user_name, enabled=enabled
+        )
+        await query.answer(
+            "Marked as watched by the group."
+            if enabled
+            else "Removed from watched titles."
+        )
     elif action == "recommend":
         created = await database(context).recommend(
             chat_id, details, user_id, user_name
@@ -144,13 +174,18 @@ async def _action(
             if created
             else "You already recommended this title."
         )
+        return
     elif action == "rate":
         await query.answer("Choose a rating from 1 to 10.")
         await query.edit_message_reply_markup(reply_markup=rating_keyboard(details))
         return
     elif action == "back":
         await query.answer()
-        await query.edit_message_reply_markup(reply_markup=media_actions_keyboard(details))
+        await query.edit_message_reply_markup(
+            reply_markup=media_actions_keyboard(
+                details, watchlist=watchlist, watched=watched
+            )
+        )
         return
     else:
         await query.answer("That action is not available.")
@@ -184,25 +219,32 @@ async def _refresh_card(
     update: Update, context: ContextTypes.DEFAULT_TYPE, details: MediaDetails
 ) -> None:
     query = update.callback_query
+    chat_id = update.effective_chat.id
     average, count = await database(context).group_rating(
-        update.effective_chat.id, details.media_type, details.tmdb_id
+        chat_id, details.media_type, details.tmdb_id
+    )
+    watchlist, watched = await database(context).catalog_state(
+        chat_id, details.media_type, details.tmdb_id
     )
     caption = media_caption(details, group_rating=average, rating_count=count)
+    keyboard = media_actions_keyboard(
+        details, watchlist=watchlist, watched=watched
+    )
     try:
         if query.message and query.message.photo:
             await query.edit_message_caption(
                 caption=caption,
                 parse_mode=ParseMode.HTML,
-                reply_markup=media_actions_keyboard(details),
+                reply_markup=keyboard,
             )
         else:
             await query.edit_message_text(
                 text=caption,
                 parse_mode=ParseMode.HTML,
-                reply_markup=media_actions_keyboard(details),
+                reply_markup=keyboard,
             )
     except BadRequest as exc:
-        if "Message is not modified" not in str(exc):
+        if "message is not modified" not in str(exc).lower():
             raise
 
 

@@ -19,7 +19,7 @@ class Settings:
     database_path: Path
     log_path: Path
     allowed_chat_ids: frozenset[int]
-    admin_user_ids: frozenset[int]
+    owner_user_ids: frozenset[int]
     language: str = "en-US"
     region: str = "US"
     result_limit: int = 8
@@ -91,7 +91,13 @@ def load_settings() -> Settings:
         database_path=database_path,
         log_path=log_path,
         allowed_chat_ids=_parse_ids(_value(module, "ALLOWED_CHAT_IDS", [])),
-        admin_user_ids=_parse_ids(_value(module, "ADMIN_USER_IDS", [])),
+        owner_user_ids=_parse_ids(
+            _value(
+                module,
+                "OWNER_USER_IDS",
+                _value(module, "ADMIN_USER_IDS", []),
+            )
+        ),
         language=str(_value(module, "LANGUAGE", "en-US")),
         region=str(_value(module, "REGION", "US")).upper(),
         result_limit=result_limit,
