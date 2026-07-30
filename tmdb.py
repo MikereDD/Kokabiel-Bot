@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Iterable
 from typing import Any
 from urllib.parse import quote_plus
 
 import aiohttp
 
-from models import MediaDetails, MediaType, SearchResult
+from models import (
+    EpisodeDetails,
+    MediaClass,
+    MediaDetails,
+    MediaType,
+    SearchResult,
+    SeasonDetails,
+    SeasonSummary,
+    SeriesStatus,
+)
 
 API_BASE = "https://api.themoviedb.org/3"
 IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 DOCUMENTARY_GENRE_ID = 99
+CACHE_SECONDS = 600.0
 
 
 class TmdbError(RuntimeError):
@@ -33,6 +44,8 @@ class TmdbClient:
         self._language = language
         self._region = region
         self._include_adult = include_adult
+        self._details_cache: dict[tuple[str, int], tuple[float, MediaDetails]] = {}
+        self._season_cache: dict[tuple[int, int], tuple[float, SeasonDetails]] = {}
 
     async def _get(self, path: str, **params: Any) -> dict[str, Any]:
         query = {"language": self._language, **params}
@@ -102,6 +115,12 @@ class TmdbClient:
         return combined[:limit]
 
     async def details(self, media_type: MediaType, tmdb_id: int) -> MediaDetails:
+        cache_key = (media_type, tmdb_id)
+        cached = self._details_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < CACHE_SECONDS:
+            return cached[1]
+
         appended = "credits,videos,external_ids,watch/providers"
         if media_type == "movie":
             appended += ",release_dates"
@@ -113,7 +132,109 @@ class TmdbClient:
             append_to_response=appended,
             include_video_language=f"{self._language.split('-')[0]},en,null",
         )
-        return self._parse_details(media_type, payload)
+        details = self._parse_details(media_type, payload)
+        self._details_cache[cache_key] = (now, details)
+        self._trim_cache(self._details_cache, 200)
+        return details
+
+    async def season_details(self, tmdb_id: int, season_number: int) -> SeasonDetails:
+        cache_key = (tmdb_id, season_number)
+        cached = self._season_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < CACHE_SECONDS:
+            return cached[1]
+
+        payload = await self._get(f"/tv/{tmdb_id}/season/{season_number}")
+        episodes: list[EpisodeDetails] = []
+        for item in payload.get("episodes", []):
+            episode_number = item.get("episode_number")
+            if not isinstance(episode_number, int):
+                continue
+            runtime = item.get("runtime")
+            episodes.append(
+                EpisodeDetails(
+                    season_number=int(item.get("season_number", season_number)),
+                    episode_number=episode_number,
+                    name=str(item.get("name") or f"Episode {episode_number}"),
+                    air_date=str(item.get("air_date")) if item.get("air_date") else None,
+                    runtime=int(runtime) if isinstance(runtime, int) and runtime > 0 else None,
+                )
+            )
+
+        details = SeasonDetails(
+            tmdb_id=tmdb_id,
+            season_number=season_number,
+            name=str(payload.get("name") or f"Season {season_number}"),
+            episodes=tuple(episodes),
+        )
+        self._season_cache[cache_key] = (now, details)
+        self._trim_cache(self._season_cache, 300)
+        return details
+
+    async def all_regular_seasons(self, details: MediaDetails) -> tuple[SeasonDetails, ...]:
+        season_numbers = [
+            season.season_number
+            for season in details.seasons
+            if season.season_number > 0
+        ]
+        if not season_numbers:
+            return ()
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch(number: int) -> SeasonDetails:
+            async with semaphore:
+                return await self.season_details(details.tmdb_id, number)
+
+        return tuple(await asyncio.gather(*(fetch(number) for number in season_numbers)))
+
+    async def released_episode_keys(
+        self, details: MediaDetails, *, today: str
+    ) -> set[tuple[int, int]]:
+        """Return regular-season episode keys that have aired by ``today``.
+
+        Completed series and older seasons can be resolved from TMDB's season
+        summaries. Only the current/latest season of an ongoing series needs a
+        season-details request, which keeps large-series progress menus fast.
+        """
+        regular = sorted(
+            (season for season in details.seasons if season.season_number > 0),
+            key=lambda season: season.season_number,
+        )
+        if not regular:
+            return set()
+
+        latest_number = regular[-1].season_number
+        keys: set[tuple[int, int]] = set()
+        for summary in regular:
+            if details.series_status == "ended":
+                keys.update(
+                    (summary.season_number, episode_number)
+                    for episode_number in range(1, summary.episode_count + 1)
+                )
+                continue
+
+            if summary.air_date and summary.air_date > today:
+                continue
+
+            if summary.air_date and summary.season_number < latest_number:
+                keys.update(
+                    (summary.season_number, episode_number)
+                    for episode_number in range(1, summary.episode_count + 1)
+                )
+                continue
+
+            # The latest ongoing season, or a season missing its summary air
+            # date, needs episode-level dates so future episodes stay unwatched.
+            season = await self.season_details(
+                details.tmdb_id, summary.season_number
+            )
+            keys.update(
+                (episode.season_number, episode.episode_number)
+                for episode in season.episodes
+                if episode.air_date and episode.air_date <= today
+            )
+        return keys
 
     def _parse_results(
         self, items: Iterable[dict[str, Any]], media_type: MediaType
@@ -159,16 +280,34 @@ class TmdbClient:
         year = date[:4] if len(date) >= 4 else "Unknown year"
         poster_path = payload.get("poster_path")
         poster_url = f"{IMAGE_BASE}{poster_path}" if poster_path else None
-        genres = tuple(
-            str(item.get("name"))
-            for item in payload.get("genres", [])
-            if item.get("name")
+        genre_items = [item for item in payload.get("genres", []) if item.get("name")]
+        genres = tuple(str(item["name"]) for item in genre_items)
+        genre_ids = {
+            int(item["id"])
+            for item in genre_items
+            if isinstance(item.get("id"), int)
+        }
+        is_documentary = DOCUMENTARY_GENRE_ID in genre_ids or any(
+            name.casefold() == "documentary" for name in genres
         )
+
+        series_status: SeriesStatus = "unknown"
+        series_type: str | None = None
+        tmdb_status: str | None = None
+        first_air_date: str | None = None
+        last_air_date: str | None = None
+        number_of_seasons = 0
+        number_of_episodes = 0
+        networks: tuple[str, ...] = ()
+        seasons: tuple[SeasonSummary, ...] = ()
 
         if media_type == "movie":
             runtime = self._format_runtime(payload.get("runtime"))
             leads = self._directors(payload)
             certification = self._movie_certification(payload)
+            media_class: MediaClass = (
+                "documentary_film" if is_documentary else "film"
+            )
         else:
             episode_runtime = next(
                 (value for value in payload.get("episode_run_time", []) if value), None
@@ -180,6 +319,40 @@ class TmdbClient:
                 if item.get("name")
             )
             certification = self._tv_certification(payload)
+            series_type = str(payload.get("type") or "").strip() or None
+            tmdb_status = str(payload.get("status") or "").strip() or None
+            series_status = self._series_status(tmdb_status)
+            first_air_date = str(payload.get("first_air_date")) if payload.get("first_air_date") else None
+            last_air_date = str(payload.get("last_air_date")) if payload.get("last_air_date") else None
+            number_of_seasons = int(payload.get("number_of_seasons") or 0)
+            number_of_episodes = int(payload.get("number_of_episodes") or 0)
+            networks = tuple(
+                str(item.get("name"))
+                for item in payload.get("networks", [])
+                if item.get("name")
+            )[:4]
+            seasons = tuple(
+                SeasonSummary(
+                    season_number=int(item.get("season_number", 0)),
+                    name=str(item.get("name") or f"Season {item.get('season_number', 0)}"),
+                    episode_count=int(item.get("episode_count") or 0),
+                    air_date=str(item.get("air_date")) if item.get("air_date") else None,
+                )
+                for item in payload.get("seasons", [])
+                if isinstance(item.get("season_number"), int)
+            )
+            is_limited = (series_type or "").casefold() in {
+                "miniseries",
+                "limited series",
+            }
+            if is_documentary and is_limited:
+                media_class = "documentary_limited_series"
+            elif is_documentary:
+                media_class = "documentary_series"
+            elif is_limited:
+                media_class = "limited_series"
+            else:
+                media_class = "tv_series"
 
         credits = payload.get("credits", {})
         cast = tuple(
@@ -213,7 +386,32 @@ class TmdbClient:
             streaming=self._provider_names(providers.get("flatrate", [])),
             rent=self._provider_names(providers.get("rent", [])),
             buy=self._provider_names(providers.get("buy", [])),
+            media_class=media_class,
+            is_documentary=is_documentary,
+            series_status=series_status,
+            tmdb_status=tmdb_status,
+            series_type=series_type,
+            first_air_date=first_air_date,
+            last_air_date=last_air_date,
+            number_of_seasons=number_of_seasons,
+            number_of_episodes=number_of_episodes,
+            networks=networks,
+            seasons=seasons,
         )
+
+    @staticmethod
+    def _series_status(value: str | None) -> SeriesStatus:
+        normalized = (value or "").casefold()
+        if normalized in {"ended", "canceled", "cancelled"}:
+            return "ended"
+        if normalized in {
+            "returning series",
+            "in production",
+            "planned",
+            "pilot",
+        }:
+            return "ongoing"
+        return "unknown"
 
     @staticmethod
     def _format_runtime(minutes: Any) -> str | None:
@@ -272,3 +470,11 @@ class TmdbClient:
                 seen.add(name)
                 names.append(name)
         return tuple(names[:6])
+
+    @staticmethod
+    def _trim_cache(cache: dict[Any, tuple[float, Any]], limit: int) -> None:
+        if len(cache) <= limit:
+            return
+        oldest = sorted(cache.items(), key=lambda item: item[1][0])[: len(cache) - limit]
+        for key, _ in oldest:
+            cache.pop(key, None)

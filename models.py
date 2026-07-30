@@ -4,6 +4,16 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 MediaType = Literal["movie", "tv"]
+MediaClass = Literal[
+    "film",
+    "documentary_film",
+    "tv_series",
+    "limited_series",
+    "documentary_series",
+    "documentary_limited_series",
+]
+SeriesStatus = Literal["ongoing", "ended", "unknown"]
+ViewingStatus = Literal["none", "watching", "watched", "caught_up", "completed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +31,31 @@ class SearchResult:
     @property
     def short_type(self) -> str:
         return "m" if self.media_type == "movie" else "t"
+
+
+@dataclass(frozen=True, slots=True)
+class SeasonSummary:
+    season_number: int
+    name: str
+    episode_count: int
+    air_date: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeDetails:
+    season_number: int
+    episode_number: int
+    name: str
+    air_date: str | None
+    runtime: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SeasonDetails:
+    tmdb_id: int
+    season_number: int
+    name: str
+    episodes: tuple[EpisodeDetails, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,28 +80,94 @@ class MediaDetails:
     streaming: tuple[str, ...] = ()
     rent: tuple[str, ...] = ()
     buy: tuple[str, ...] = ()
+    media_class: MediaClass = "film"
+    is_documentary: bool = False
+    series_status: SeriesStatus = "unknown"
+    tmdb_status: str | None = None
+    series_type: str | None = None
+    first_air_date: str | None = None
+    last_air_date: str | None = None
+    number_of_seasons: int = 0
+    number_of_episodes: int = 0
+    networks: tuple[str, ...] = ()
+    seasons: tuple[SeasonSummary, ...] = ()
 
     @property
     def short_type(self) -> str:
         return "m" if self.media_type == "movie" else "t"
 
+    @property
+    def is_series(self) -> bool:
+        return self.media_type == "tv"
+
+    @property
+    def type_label(self) -> str:
+        labels = {
+            "film": "Film",
+            "documentary_film": "Documentary Film",
+            "tv_series": "TV Series",
+            "limited_series": "Limited Series",
+            "documentary_series": "Documentary Series",
+            "documentary_limited_series": "Documentary Limited Series",
+        }
+        return labels[self.media_class]
+
+    @property
+    def icon(self) -> str:
+        if self.is_documentary:
+            return "🎥"
+        return "🎬" if self.media_type == "movie" else "📺"
+
 
 @dataclass(frozen=True, slots=True)
-class CatalogEntry:
+class PersonalEntry:
+    chat_id: int
+    user_id: int
+    media_type: MediaType
+    tmdb_id: int
+    title: str
+    year: str
+    media_class: MediaClass
+    poster_url: str | None
+    watchlist: bool
+    viewing_status: ViewingStatus
+    updated_at: str
+    watched_episodes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class GroupEntry:
     chat_id: int
     media_type: MediaType
     tmdb_id: int
     title: str
     year: str
+    media_class: MediaClass
     poster_url: str | None
-    added_by: int
-    added_by_name: str
-    added_at: str
-    watchlist: bool = False
-    watched: bool = False
-    recommended_by: tuple[str, ...] = field(default_factory=tuple)
+    member_count: int
+    member_names: tuple[str, ...] = field(default_factory=tuple)
     group_rating: float | None = None
     rating_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SuggestionEntry:
+    chat_id: int
+    media_type: MediaType
+    tmdb_id: int
+    title: str
+    year: str
+    media_class: MediaClass
+    suggested_count: int
+    suggested_by: tuple[str, ...] = field(default_factory=tuple)
+    suggested_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class UserMediaState:
+    watchlist: bool = False
+    viewing_status: ViewingStatus = "none"
+    watched_episodes: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,9 +15,13 @@ from handlers.commands import (
     documentary,
     help_command,
     movie,
+    myprogress,
+    mysuggestions,
+    mywatchlist,
     random_pick,
     search,
     start,
+    suggestions,
     tv,
     watched,
     watchlist,
@@ -44,8 +48,12 @@ COMMANDS = [
     BotCommand("tv", "Search for a TV series"),
     BotCommand("documentary", "Search for a documentary"),
     BotCommand("search", "Search films and TV together"),
+    BotCommand("mywatchlist", "Show your personal watchlist"),
+    BotCommand("watched", "Show your watched titles"),
+    BotCommand("myprogress", "Show your series progress"),
     BotCommand("watchlist", "Show the group watchlist"),
-    BotCommand("watched", "Show watched titles"),
+    BotCommand("suggestions", "Show group suggestions"),
+    BotCommand("mysuggestions", "Show your suggestions"),
     BotCommand("random", "Pick from the group watchlist"),
     BotCommand("about", "Show credits and TMDB attribution"),
     BotCommand("help", "Show commands and privacy behavior"),
@@ -107,7 +115,11 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("documentary", documentary))
     application.add_handler(CommandHandler("search", search))
     application.add_handler(CommandHandler("watchlist", watchlist))
+    application.add_handler(CommandHandler("mywatchlist", mywatchlist))
     application.add_handler(CommandHandler("watched", watched))
+    application.add_handler(CommandHandler("myprogress", myprogress))
+    application.add_handler(CommandHandler("suggestions", suggestions))
+    application.add_handler(CommandHandler("mysuggestions", mysuggestions))
     application.add_handler(CommandHandler("random", random_pick))
 
     application.add_handler(CommandHandler("adminhelp", adminhelp))

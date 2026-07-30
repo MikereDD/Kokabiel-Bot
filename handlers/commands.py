@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from html import escape
 from pathlib import Path
 from secrets import token_hex
 
@@ -9,13 +10,15 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from credits import ABOUT_CAPTION
-from formatting import catalog_text, media_caption, random_pick_text
-from handlers.common import allowed, database, settings, tmdb
-from keyboards import (
-    about_keyboard,
-    media_actions_keyboard,
-    search_results_keyboard,
+from formatting import (
+    group_watchlist_text,
+    media_caption,
+    personal_list_text,
+    random_pick_text,
+    suggestions_text,
 )
+from handlers.common import allowed, database, settings, tmdb, user_identity
+from keyboards import about_keyboard, media_actions_keyboard, search_results_keyboard
 from models import SearchResult
 from tmdb import TmdbError
 
@@ -23,16 +26,27 @@ SearchFunction = Callable[[str, int], Awaitable[list[SearchResult]]]
 
 HELP_TEXT = """<b>Kokabiel commands</b>
 
+<b>Discover</b>
 /movie &lt;title&gt; — search films
-/tv &lt;title&gt; — search TV series
-/documentary &lt;title&gt; — search documentaries
-/search &lt;title&gt; — search films and TV together
-/watchlist — show the shared group watchlist
-/watched — show titles marked watched
-/random — choose from the shared watchlist
+/tv &lt;title&gt; — search TV and limited series
+/documentary &lt;title&gt; — search documentary films and series
+/search &lt;title&gt; — search everything together
+/random — choose from the group watchlist
+
+<b>Personal</b>
+/mywatchlist — show your personal watchlist
+/watched — show your watched, caught-up, and completed titles
+/myprogress — show your TV and documentary-series progress
+/mysuggestions — show titles you suggested to this group
+
+<b>Group</b>
+/watchlist — show titles members saved to their watchlists
+/suggestions — show the group suggestion list
+
 /about — show Kokabiel credits and TMDB attribution
 /help — show this message
 
+Every member has independent watchlists, ratings, and episode progress.
 Kokabiel responds only to commands and its own buttons.
 It does not inspect ordinary group conversation.
 """
@@ -110,7 +124,7 @@ async def _search(
         search_cache.pop(next(iter(search_cache)))
 
     await update.effective_message.reply_text(
-        f"Choose the correct title for <b>{_escape(query)}</b>:",
+        f"Choose the correct title for <b>{escape(query)}</b>:",
         parse_mode=ParseMode.HTML,
         reply_markup=search_results_keyboard(
             results, search_token=search_token, page=0
@@ -121,27 +135,82 @@ async def _search(
 async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await allowed(update, context):
         return
-    entries = await database(context).list_entries(update.effective_chat.id, watchlist=True)
+    entries = await database(context).list_group_watchlist(update.effective_chat.id)
     await update.effective_message.reply_text(
-        catalog_text("Group watchlist", entries), parse_mode=ParseMode.HTML
+        group_watchlist_text(entries), parse_mode=ParseMode.HTML
+    )
+
+
+async def mywatchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    user_id, user_name = user_identity(update)
+    entries = await database(context).list_personal_watchlist(
+        update.effective_chat.id, user_id
+    )
+    await update.effective_message.reply_text(
+        personal_list_text(f"{user_name}’s watchlist", entries),
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await allowed(update, context):
         return
-    entries = await database(context).list_entries(update.effective_chat.id, watched=True)
+    user_id, user_name = user_identity(update)
+    entries = await database(context).list_personal_watched(
+        update.effective_chat.id, user_id
+    )
     await update.effective_message.reply_text(
-        catalog_text("Watched by the group", entries), parse_mode=ParseMode.HTML
+        personal_list_text(f"{user_name}’s watched titles", entries),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def myprogress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    user_id, user_name = user_identity(update)
+    entries = await database(context).list_personal_progress(
+        update.effective_chat.id, user_id
+    )
+    await update.effective_message.reply_text(
+        personal_list_text(f"{user_name}’s series progress", entries),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def suggestions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    entries = await database(context).list_group_suggestions(update.effective_chat.id)
+    await update.effective_message.reply_text(
+        suggestions_text("Group suggestions", entries),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def mysuggestions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await allowed(update, context):
+        return
+    user_id, user_name = user_identity(update)
+    entries = await database(context).list_my_suggestions(
+        update.effective_chat.id, user_id
+    )
+    await update.effective_message.reply_text(
+        suggestions_text(f"{user_name}’s suggestions", entries, personal=True),
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def random_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await allowed(update, context):
         return
-    entry = await database(context).random_watchlist(update.effective_chat.id)
+    entry = await database(context).random_group_watchlist(update.effective_chat.id)
     if entry is None:
-        await update.effective_message.reply_text("The group watchlist is empty.")
+        await update.effective_message.reply_text(
+            "The group watchlist is empty. Members can add titles with My Watchlist."
+        )
         return
 
     details = await tmdb(context).details(entry.media_type, entry.tmdb_id)
@@ -156,21 +225,11 @@ async def random_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             details.poster_url,
             caption=media_caption(details, group_rating=average, rating_count=count),
             parse_mode=ParseMode.HTML,
-            reply_markup=media_actions_keyboard(
-                details, watchlist=entry.watchlist, watched=entry.watched
-            ),
+            reply_markup=media_actions_keyboard(details),
         )
     else:
         await update.effective_message.reply_text(
             media_caption(details, group_rating=average, rating_count=count),
             parse_mode=ParseMode.HTML,
-            reply_markup=media_actions_keyboard(
-                details, watchlist=entry.watchlist, watched=entry.watched
-            ),
+            reply_markup=media_actions_keyboard(details),
         )
-
-
-def _escape(value: str) -> str:
-    from html import escape
-
-    return escape(value)
