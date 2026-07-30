@@ -1,23 +1,28 @@
-"""Copy this file to ~/bots/config/kokabielrc.py and add your private tokens."""
+"""Private runtime configuration for Kokabiel."""
 
 from pathlib import Path
 
 BOT_TOKEN = ""
 TMDB_BEARER_TOKEN = ""
 
-KOKABIEL_DIR = Path.home() / "bots" / "Kokabiel"
-DATABASE_PATH = KOKABIEL_DIR / "kokabiel.db"
-LOG_PATH = KOKABIEL_DIR / "kokabiel.log"
+BOTS_DIR = Path.home() / "bots"
 
-# Empty allows private testing anywhere the bot is added.
-# Add the group's long negative chat ID when ready to lock it down.
-ALLOWED_CHAT_IDS = []
-# Only these Telegram user IDs can use Kokabiel owner commands.
+DATABASE_PATH = BOTS_DIR / "data" / "kokabiel" / "kokabiel.db"
+LOG_PATH = BOTS_DIR / "logs" / "kokabiel" / "kokabiel.log"
+
+# Empty allows Kokabiel to operate wherever it is added.
+# Add the group's long negative Telegram chat ID to restrict it.
+ALLOWED_CHAT_IDS = [
+    # -1001234567890,
+]
+
+# Legacy compatibility.
+ADMIN_USER_IDS = []
+
+# Only these Telegram user IDs can use owner commands.
 OWNER_USER_IDS = [
     # 123456789,
 ]
-
-# Legacy ADMIN_USER_IDS is still accepted if OWNER_USER_IDS is absent.
 
 LANGUAGE = "en-US"
 REGION = "US"
@@ -25,7 +30,10 @@ RESULT_LIMIT = 8
 INCLUDE_ADULT = False
 LOG_LEVEL = "INFO"
 
-# Your existing local Telegram Bot API server on Arakiel.
-# Set both to "" to use Telegram's normal cloud Bot API instead.
-LOCAL_BOT_API_URL = "http://127.0.0.1:8081/bot"
-LOCAL_BOT_API_FILE_URL = "http://127.0.0.1:8081/file/bot"
+# Leave both blank to use Telegram's normal cloud Bot API.
+LOCAL_BOT_API_URL = ""
+LOCAL_BOT_API_FILE_URL = ""
+
+# ── Notes ───────────────────────────────────
+# - Do not commit your real BOT_TOKEN.
+# - Keep this private configuration outside the repository.

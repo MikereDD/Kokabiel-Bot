@@ -64,9 +64,36 @@ def _parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parse_required_path(module: ModuleType, name: str) -> Path:
+    """Read a required path from the rc file or matching environment variable.
+
+    The value may be a string or pathlib.Path. Shell-style environment variables
+    such as $HOME and user-home markers such as ~ are expanded before validation.
+    """
+
+    raw_value = _value(module, name, "")
+    value = str(raw_value or "").strip()
+    if not value:
+        raise ConfigError(
+            f"{name} is required in ~/bots/config/kokabielrc.py. "
+            "Use an absolute path or a $HOME/~/ based path."
+        )
+
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    path = Path(expanded)
+    if not path.is_absolute():
+        raise ConfigError(
+            f"{name} must resolve to an absolute path, but received: {value!r}"
+        )
+    return path
+
+
 def load_settings() -> Settings:
     default_path = Path.home() / "bots" / "config" / "kokabielrc.py"
-    config_path = Path(os.environ.get("KOKABIEL_CONFIG", default_path)).expanduser()
+    configured_path = os.environ.get("KOKABIEL_CONFIG", str(default_path))
+    config_path = Path(
+        os.path.expandvars(os.path.expanduser(configured_path))
+    )
     module = _load_module(config_path)
 
     bot_token = str(_value(module, "BOT_TOKEN", "")).strip()
@@ -76,8 +103,9 @@ def load_settings() -> Settings:
     if not tmdb_token:
         raise ConfigError("TMDB_BEARER_TOKEN is required.")
 
-    database_path = Path(str(_value(module, "DATABASE_PATH"))).expanduser()
-    log_path = Path(str(_value(module, "LOG_PATH"))).expanduser()
+    database_path = _parse_required_path(module, "DATABASE_PATH")
+    log_path = _parse_required_path(module, "LOG_PATH")
+
     result_limit = int(_value(module, "RESULT_LIMIT", 8))
     if not 1 <= result_limit <= 10:
         raise ConfigError("RESULT_LIMIT must be between 1 and 10.")
