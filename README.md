@@ -1,27 +1,106 @@
-# Kokabiel — Film, TV & Documentary Guide
+<div align="center">
 
-Kokabiel is a command-and-button-driven Telegram bot for discovering films, TV series, miniseries, documentary films, and documentary series inside a real group chat.
+<img src="assets/kokabiel-avatar.png" alt="Kokabiel" width="180">
 
-It does not monitor ordinary conversation. It responds only to commands and its own buttons.
+# Kokabiel
 
-## Folder layout on Arakiel
+### Film, TV & Documentary Guide for Telegram
+
+**Command-driven discovery · Personal progress · Group watchlists · TMDB-powered metadata**
+
+</div>
+
+Kokabiel is a Telegram bot built for groups that discover, discuss, and keep
+track of films, television series, miniseries, documentary films, and
+documentary series together.
+
+Kokabiel is deliberately **command-and-button driven**. It does not passively
+read ordinary group conversation, scan message history for titles, or post
+unsolicited recommendations. A member invokes the bot, selects the correct
+production, and interacts with Kokabiel through explicit controls.
+
+## Highlights
+
+- Search movies, television, documentaries, or both media types together.
+- Disambiguate remakes and same-name productions before posting a card.
+- Media-aware cards distinguish films, documentary films, TV series, limited
+  series, documentary series, and documentary limited series.
+- Personal watchlists, ratings, watched status, and episode progress are scoped
+  to both Telegram chat ID and user ID.
+- Group watchlists aggregate members' personal selections without erasing
+  individual ownership.
+- Group suggestions combine duplicate titles while preserving who suggested
+  them.
+- Series progress supports episode and season controls, `Watching`, `Caught up`,
+  and `Completed` states.
+- Owner-only administration includes runtime status, configuration reload,
+  restart/shutdown controls, group inspection, and leave-group actions.
+- SQLite keeps the deployment lightweight and self-contained.
+
+## Commands
+
+| Area | Commands |
+| --- | --- |
+| Discovery | `/movie <title>` · `/tv <title>` · `/documentary <title>` · `/search <title>` · `/random` |
+| Personal | `/mywatchlist` · `/watched` · `/myprogress` · `/mysuggestions` |
+| Group | `/watchlist` · `/suggestions` |
+| General | `/about` · `/help` |
+| Owner | `/adminhelp` · `/whoami` · `/groups` · `/leave` · `/leavechat <chat_id>` · `/status` · `/reload` · `/restart` · `/shutdown` |
+
+Destructive or disruptive owner actions require confirmation. Sensitive runtime
+commands are restricted to Kokabiel's private chat.
+
+## Privacy model
+
+Kokabiel registers command handlers and callback-button handlers; it has no
+ordinary-text message handler for passive title detection or conversation
+monitoring.
+
+Keep **Privacy Mode enabled** in BotFather:
+
+1. Open BotFather.
+2. Run `/setprivacy`.
+3. Select Kokabiel.
+4. Choose **Enable**.
+
+Kokabiel does not require Telegram administrator status for its normal feature
+set.
+
+## Requirements
+
+- Python 3.11 or newer recommended
+- Telegram bot token from BotFather
+- TMDB API Read Access Token
+- Network access to Telegram and TMDB
+
+Install the Python dependencies from `requirements.txt`.
+
+## Repository layout
 
 ```text
-~/bots/
-├── Kokabiel/
-│   ├── kokabiel.py
-│   ├── app.py
-│   ├── database.py
-│   ├── tmdb.py
-│   ├── handlers/
-│   ├── assets/
-│   ├── requirements.txt
-│   └── README.md
-└── config/
-    └── kokabielrc.py
+Kokabiel/
+├── assets/                  # Kokabiel and required attribution artwork
+├── docs/                    # third-party attribution and project documentation
+├── handlers/                # Telegram command/callback/owner handlers
+├── app.py                   # application construction and handler registration
+├── config.py                # external runtime configuration loader
+├── database.py              # SQLite schema, migrations, and persistence
+├── formatting.py            # Telegram-safe presentation formatting
+├── keyboards.py             # inline keyboard builders
+├── kokabiel.py              # direct-script entry point
+├── kokabielrc.example.py    # safe configuration template
+├── models.py                # domain models
+├── tmdb.py                  # async TMDB client
+├── requirements.txt
+├── CHANGELOG.md
+├── LICENSE.md
+├── SECURITY.md
+└── README.md
 ```
 
-## Setup
+## Installation
+
+Kokabiel remains a direct Python bot rather than an installed Python package.
 
 ```bash
 cd "$HOME/bots/Kokabiel"
@@ -30,7 +109,7 @@ python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Create the private configuration beside the other bot configs:
+Create a private configuration **outside the repository**:
 
 ```bash
 mkdir -p "$HOME/bots/config"
@@ -39,113 +118,85 @@ chmod 600 "$HOME/bots/config/kokabielrc.py"
 vim "$HOME/bots/config/kokabielrc.py"
 ```
 
-Add the Telegram BotFather token, TMDB API Read Access Token, and owner ID:
+At minimum, configure `BOT_TOKEN`, `TMDB_BEARER_TOKEN`, and the owner user ID.
+Use `ALLOWED_CHAT_IDS` when Kokabiel should be restricted to known groups.
 
 ```python
 OWNER_USER_IDS = [123456789]
+
+ALLOWED_CHAT_IDS = [
+    # -1001234567890,
+]
 ```
 
-Only configured owners can use owner commands. Telegram group administrators do not inherit owner access.
+Telegram group administrators do **not** automatically inherit Kokabiel owner
+access.
 
-## Run
+## Running Kokabiel
 
 ```bash
 cd "$HOME/bots/Kokabiel"
 .venv/bin/python kokabiel.py
 ```
 
-Kokabiel remains a direct Python bot. It is not installed as a package.
+The default private configuration path is:
 
-## Media-aware cards
+```text
+$HOME/bots/config/kokabielrc.py
+```
 
-Kokabiel classifies each result before building the card:
+Override it with `KOKABIEL_CONFIG` when necessary.
 
-- Film
-- Documentary Film
-- TV Series
-- Limited Series
-- Documentary Series
-- Documentary Limited Series
+## Data and runtime files
 
-Movie cards emphasize runtime and director. Series cards show series status, seasons, episodes, episode length, creators, and network/platform information.
+The example configuration stores runtime state outside the repository:
 
-## Personal behavior
+```text
+$HOME/bots/data/kokabiel/kokabiel.db
+$HOME/bots/logs/kokabiel/kokabiel.log
+```
 
-Every viewing action is stored by Telegram chat ID and Telegram user ID.
+Database, log, local configuration, virtual-environment, Python-cache, and
+common secret-key files are excluded by `.gitignore`.
 
-- **My Watchlist** is personal.
-- Movie and documentary-film watched status is personal.
-- TV, limited-series, and documentary-series progress is personal.
-- Ratings are personal; Kokabiel calculates a separate group average.
-- Personal menus are tied to the member who opened them.
+## Media data and attribution
 
-For series, **My Progress** supports:
+TMDB provides Kokabiel's primary media metadata and imagery. Kokabiel links to
+IMDb only when TMDB supplies an IMDb title ID; Kokabiel does not scrape IMDb.
+Streaming-provider availability returned through TMDB is sourced from
+JustWatch and is attributed when displayed.
 
-- Marking individual released episodes watched or unwatched
-- Marking a released season watched
-- Clearing a season
-- Marking all released episodes watched
-- Setting a series to Watching
-- Clearing all personal progress
-- Automatic **Caught up** status for ongoing series
-- Automatic **Completed** status for ended series and miniseries
+> This product uses the TMDB API but is not endorsed or certified by TMDB.
 
-## Group behavior
+See [`docs/ATTRIBUTION.md`](docs/ATTRIBUTION.md) for third-party attribution and
+asset details.
 
-The shared card remains neutral because everyone in the group sees it.
+## Validation before deployment
 
-- `/watchlist` aggregates titles currently saved by members.
-- `/suggestions` shows titles members suggested to the group.
-- Duplicate suggestions are combined while preserving who suggested the title.
-- `/random` chooses from the aggregated group watchlist.
+From the repository root:
 
-## Commands
+```bash
+python -m compileall -q .
+```
 
-### Discovery
+For behavior that depends on Telegram, TMDB, and real group state, use the live
+checklist in [`TEST-PERSONAL-GROUP.md`](TEST-PERSONAL-GROUP.md) after deploying
+with non-production test credentials where practical.
 
-- `/movie <title>`
-- `/tv <title>`
-- `/documentary <title>`
-- `/search <title>`
-- `/random`
+## Source availability and license
 
-### Personal
+Kokabiel's source is publicly viewable for transparency, review, and reference,
+but **Kokabiel is not open-source software**. Copyright and control remain with
+Typezer∅. Public availability of this repository does not grant blanket
+permission to redistribute, repackage, sell, incorporate, or publish modified
+versions of the project.
 
-- `/mywatchlist`
-- `/watched`
-- `/myprogress`
-- `/mysuggestions`
+See [`LICENSE.md`](LICENSE.md) for the complete source-code notice.
 
-### Group
+---
 
-- `/watchlist`
-- `/suggestions`
+<div align="center">
 
-### General
+**Kokabiel · Typezer∅**
 
-- `/about`
-- `/help`
-
-## Owner commands
-
-- `/adminhelp`
-- `/whoami`
-- `/groups`
-- `/leave`
-- `/leavechat <chat_id>`
-- `/status`
-- `/reload`
-- `/restart`
-- `/shutdown`
-
-`/leave`, `/leavechat`, `/restart`, and `/shutdown` require confirmation. Sensitive runtime commands must be used in Kokabiel's private chat.
-
-## Database migration
-
-On first startup after this update, Kokabiel creates the personal-state, episode-progress, and group-suggestion tables automatically.
-
-Existing group watchlist/watched entries are preserved by assigning each old entry to the member who originally added it. Existing recommendations are migrated into group suggestions.
-
-## TMDB attribution
-
-This product uses the TMDB API but is not endorsed or certified by TMDB.
+</div>

@@ -1,8 +1,51 @@
+# Python
 __pycache__/
 *.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime state
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 *.log
+logs/
+data/
+
+# Private configuration / secrets
 kokabielrc.py
-.venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Packaging / build output
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local archives and backups
+*.zip
+*.tar
+*.tar.gz
+*.bak

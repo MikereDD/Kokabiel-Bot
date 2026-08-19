@@ -11,7 +11,7 @@ BOT_TAGLINE = "Film, TV & Documentary Guide"
 ABOUT_CAPTION = f"""<b>Kokabiel — {BOT_TAGLINE}</b>
 
 Command-driven discovery for films, TV series, and documentaries,
-with shared group watchlists, ratings, and recommendations.
+with personal progress, group watchlists, ratings, and suggestions.
 
 <b>Privacy</b>
 Kokabiel responds only to commands and its own buttons.
@@ -19,6 +19,7 @@ It does not inspect ordinary group conversation.
 
 <b>Data and images</b>
 Kokabiel uses TMDB as its primary catalog and links to IMDb only
-when TMDB supplies an IMDb title ID.
+when TMDB supplies an IMDb title ID. Streaming-provider availability
+returned through TMDB is sourced from JustWatch.
 
 <i>{TMDB_ATTRIBUTION_NOTICE}</i>"""

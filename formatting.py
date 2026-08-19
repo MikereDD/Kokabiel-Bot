@@ -77,7 +77,11 @@ def media_caption(
 
     overview = escape(details.overview.strip() or "No synopsis is currently available.")
     prefix = "\n".join(lines) + "\n\n"
-    suffix = "\n\n<i>Media data supplied by TMDB.</i>"
+    provider_attribution = bool(details.streaming or details.rent or details.buy)
+    suffix = "\n\n<i>Media data supplied by TMDB."
+    if provider_attribution:
+        suffix += " Streaming availability powered by JustWatch."
+    suffix += "</i>"
     room = TELEGRAM_PHOTO_CAPTION_LIMIT - len(prefix) - len(suffix)
     if room < 40:
         overview = ""

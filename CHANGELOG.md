@@ -4,6 +4,8 @@
 
 ### Added
 
+- Repository-level source license notice, security policy, and third-party attribution documentation for public GitHub publication.
+- Explicit JustWatch attribution when streaming-provider availability is displayed.
 - Media-aware classification for films, documentary films, TV series, limited series, documentary series, and documentary limited series.
 - Classification-specific output cards with series status, season count, episode count, episode runtime, network/platform, and original-run dates.
 - Personal watchlists keyed by chat ID and Telegram user ID.
@@ -21,6 +23,9 @@
 
 ### Changed
 
+- Reorganized Telegram handlers under `handlers/` and artwork under `assets/` so the repository layout matches the runtime imports and asset paths.
+- Revamped the project README for standalone GitHub publication and deployment.
+- Expanded `.gitignore` coverage for runtime data, private configuration, credentials, build output, editor files, and local archives.
 - Shared media cards now use neutral controls that make sense to every member.
 - `Recommend` is now `Suggest to Group`.
 - `/watched` now shows the requesting member's watched, caught-up, and completed titles.
