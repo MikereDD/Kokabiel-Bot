@@ -4,6 +4,13 @@
 
 # Kokabiel
 
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![Platform](https://img.shields.io/badge/platform-Telegram-26A5E4)
+![Library](https://img.shields.io/badge/python--telegram--bot-21.x-blue)
+![Database](https://img.shields.io/badge/database-SQLite-07405E)
+![API](https://img.shields.io/badge/data-TMDB-01B4E4)
+![License](https://img.shields.io/badge/license-Typezer%E2%88%85%20All%20Rights%20Reserved-darkred)
+
 ### Film, TV & Documentary Guide for Telegram
 
 **Command-driven discovery · Personal progress · Group watchlists · TMDB-powered metadata**
