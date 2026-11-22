@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from html import escape
 
-from models import GroupEntry, MediaDetails, PersonalEntry, SearchResult, SuggestionEntry
+from models import (GroupEntry, MediaDetails, PersonalEntry, SearchResult,
+                    SuggestionEntry)
 
 TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
+TELEGRAM_MESSAGE_SOFT_LIMIT = 3900
 
 
 def selection_label(result: SearchResult) -> str:
@@ -23,8 +25,7 @@ def media_caption(
     rating_count: int = 0,
 ) -> str:
     heading = (
-        f"{details.icon} <b>{escape(details.title)}</b> "
-        f"({_display_years(details)})"
+        f"{details.icon} <b>{escape(details.title)}</b> " f"({_display_years(details)})"
     )
 
     metadata = [details.type_label]
@@ -50,7 +51,9 @@ def media_caption(
         if details.runtime:
             lines.append(f"<b>Episode length:</b> {escape(details.runtime)}")
         if details.networks:
-            lines.append(f"<b>Network/Platform:</b> {escape(', '.join(details.networks))}")
+            lines.append(
+                f"<b>Network/Platform:</b> {escape(', '.join(details.networks))}"
+            )
 
     if details.genres:
         lines.append(f"<b>Genres:</b> {escape(', '.join(details.genres[:5]))}")
@@ -62,7 +65,9 @@ def media_caption(
         )
     if group_rating is not None and rating_count:
         noun = "rating" if rating_count == 1 else "ratings"
-        lines.append(f"<b>Group rating:</b> {group_rating:.1f}/10 ({rating_count} {noun})")
+        lines.append(
+            f"<b>Group rating:</b> {group_rating:.1f}/10 ({rating_count} {noun})"
+        )
 
     lead_label = "Director" if details.media_type == "movie" else "Created by"
     if details.directors_or_creators:
@@ -132,7 +137,9 @@ def personal_list_text(title: str, entries: list[PersonalEntry]) -> str:
     return "\n".join(lines)
 
 
-def suggestions_text(title: str, entries: list[SuggestionEntry], *, personal: bool = False) -> str:
+def suggestions_text(
+    title: str, entries: list[SuggestionEntry], *, personal: bool = False
+) -> str:
     if not entries:
         return f"<b>{escape(title)}</b>\n\nNo suggestions yet."
 
@@ -226,3 +233,171 @@ def _truncate_plain(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 1].rstrip() + "…"
+
+
+def personal_progress_text(
+    user_name: str,
+    entries: list[PersonalEntry],
+    released_counts: dict[tuple[str, int], tuple[int, int]] | None = None,
+) -> str:
+    """Render personal viewing history as a grouped media dashboard."""
+
+    if not entries:
+        return (
+            f"🎞 <b>{escape(user_name)}’s media progress</b>\n\n"
+            "Nothing watched or in progress yet."
+        )
+
+    released_counts = released_counts or {}
+
+    sections = (
+        (
+            "🎬 <b>FILMS</b>",
+            [
+                entry
+                for entry in entries
+                if entry.media_class == "film"
+            ],
+        ),
+        (
+            "📺 <b>TV SERIES</b>",
+            [
+                entry
+                for entry in entries
+                if entry.media_class in {"tv_series", "limited_series"}
+            ],
+        ),
+        (
+            "🎥 <b>DOCUMENTARIES</b>",
+            [
+                entry
+                for entry in entries
+                if entry.media_class
+                in {
+                    "documentary_film",
+                    "documentary_series",
+                    "documentary_limited_series",
+                }
+            ],
+        ),
+    )
+
+    lines = [f"🎞 <b>{escape(user_name)}’s media progress</b>"]
+
+    status_order = {
+        "watching": 0,
+        "caught_up": 1,
+        "completed": 2,
+        "watched": 2,
+        "none": 3,
+    }
+
+    shown = 0
+    truncated = False
+
+    for heading, section_entries in sections:
+        if not section_entries:
+            continue
+
+        section_entries.sort(
+            key=lambda entry: (
+                status_order.get(entry.viewing_status, 99),
+                entry.title.casefold(),
+                entry.year,
+            )
+        )
+
+        section_started = False
+
+        for entry in section_entries:
+            if shown >= 30:
+                truncated = True
+                break
+
+            icon, status_name = _progress_status(entry.viewing_status)
+
+            block = [
+                f"{icon} <b>{escape(entry.title)}</b> ({escape(entry.year)})"
+            ]
+
+            if entry.media_type == "tv":
+                key = (entry.media_type, entry.tmdb_id)
+                released_progress = released_counts.get(key)
+
+                if (
+                    released_progress is not None
+                    and released_progress[1] > 0
+                ):
+                    watched_released, released = released_progress
+                    block.append(
+                        f"   {_progress_bar(watched_released, released)} "
+                        f"{watched_released}/{released} released"
+                    )
+                else:
+                    noun = (
+                        "episode"
+                        if entry.watched_episodes == 1
+                        else "episodes"
+                    )
+                    block.append(
+                        f"   {entry.watched_episodes} {noun} watched"
+                    )
+
+            block.append(
+                f"   {escape(_media_class_label(entry.media_class))}"
+                f" · {escape(status_name)}"
+            )
+
+            if section_started:
+                addition = ["", *block]
+            else:
+                addition = [
+                    "",
+                    heading,
+                    "━━━━━━━━━━━━━━━━━━",
+                    *block,
+                ]
+
+            candidate = "\n".join([*lines, *addition])
+
+            # Leave room for the final “…and N more” notice.
+            if len(candidate) > TELEGRAM_MESSAGE_SOFT_LIMIT - 64:
+                truncated = True
+                break
+
+            lines.extend(addition)
+            section_started = True
+            shown += 1
+
+        if truncated:
+            break
+
+    remaining = len(entries) - shown
+    if remaining > 0:
+        notice = f"\n…and {remaining} more."
+        candidate = "\n".join(lines) + notice
+        if len(candidate) <= TELEGRAM_MESSAGE_SOFT_LIMIT:
+            lines.append(f"\n…and {remaining} more.")
+
+    return "\n".join(lines)
+
+def _progress_status(status: str) -> tuple[str, str]:
+    return {
+        "watching": ("▶", "Watching"),
+        "watched": ("✅", "Watched"),
+        "caught_up": ("✅", "Caught up"),
+        "completed": ("🏁", "Completed"),
+    }.get(status, ("•", "Not started"))
+
+
+def _progress_bar(watched: int, released: int, width: int = 10) -> str:
+    if released <= 0:
+        return "░" * width
+
+    ratio = min(1.0, max(0.0, watched / released))
+    filled = round(ratio * width)
+
+    if watched > 0 and filled == 0:
+        filled = 1
+
+    return ("█" * filled) + ("░" * (width - filled))

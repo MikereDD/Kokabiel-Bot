@@ -50,7 +50,7 @@ COMMANDS = [
     BotCommand("search", "Search films and TV together"),
     BotCommand("mywatchlist", "Show your personal watchlist"),
     BotCommand("watched", "Show your watched titles"),
-    BotCommand("myprogress", "Show your series progress"),
+    BotCommand("myprogress", "Show your media progress"),
     BotCommand("watchlist", "Show the group watchlist"),
     BotCommand("suggestions", "Show group suggestions"),
     BotCommand("mysuggestions", "Show your suggestions"),

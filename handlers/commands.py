@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import date
 from html import escape
 from pathlib import Path
 from secrets import token_hex
@@ -14,12 +16,13 @@ from formatting import (
     group_watchlist_text,
     media_caption,
     personal_list_text,
+    personal_progress_text,
     random_pick_text,
     suggestions_text,
 )
 from handlers.common import allowed, database, settings, tmdb, user_identity
 from keyboards import about_keyboard, media_actions_keyboard, search_results_keyboard
-from models import SearchResult
+from models import PersonalEntry, SearchResult
 from tmdb import TmdbError
 
 SearchFunction = Callable[[str, int], Awaitable[list[SearchResult]]]
@@ -36,7 +39,7 @@ HELP_TEXT = """<b>Kokabiel commands</b>
 <b>Personal</b>
 /mywatchlist — show your personal watchlist
 /watched — show your watched, caught-up, and completed titles
-/myprogress — show your TV and documentary-series progress
+/myprogress — show your film, TV, and documentary progress
 /mysuggestions — show titles you suggested to this group
 
 <b>Group</b>
@@ -170,14 +173,74 @@ async def watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def myprogress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await allowed(update, context):
         return
+
     user_id, user_name = user_identity(update)
     entries = await database(context).list_personal_progress(
         update.effective_chat.id, user_id
     )
+
+    released_counts = await _progress_released_counts(
+        context,
+        entries[:30],
+    )
+
     await update.effective_message.reply_text(
-        personal_list_text(f"{user_name}’s series progress", entries),
+        personal_progress_text(
+            user_name,
+            entries,
+            released_counts,
+        ),
         parse_mode=ParseMode.HTML,
     )
+
+
+async def _progress_released_counts(
+    context: ContextTypes.DEFAULT_TYPE,
+    entries: list[PersonalEntry],
+) -> dict[tuple[str, int], tuple[int, int]]:
+    """Resolve current released-episode totals without failing the dashboard."""
+
+    client = tmdb(context)
+    today = date.today().isoformat()
+    semaphore = asyncio.Semaphore(4)
+
+    async def resolve(
+        entry: PersonalEntry,
+    ) -> tuple[tuple[str, int], tuple[int, int] | None]:
+        key = (entry.media_type, entry.tmdb_id)
+
+        if entry.media_type != "tv":
+            return key, None
+
+        try:
+            async with semaphore:
+                details = await client.details(
+                    entry.media_type,
+                    entry.tmdb_id,
+                )
+                released = await client.released_episode_keys(
+                    details,
+                    today=today,
+                )
+        except TmdbError:
+            return key, None
+
+        watched = await database(context).watched_episode_keys(
+            entry.chat_id,
+            entry.user_id,
+            entry.tmdb_id,
+        )
+        return key, (len(watched & released), len(released))
+
+    results = await asyncio.gather(
+        *(resolve(entry) for entry in entries if entry.media_type == "tv")
+    )
+
+    return {
+        key: count
+        for key, count in results
+        if count is not None
+    }
 
 
 async def suggestions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

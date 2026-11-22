@@ -736,7 +736,7 @@ class Database:
         return await self._list_personal(
             chat_id,
             user_id,
-            "ums.media_type = 'tv' AND ums.viewing_status != 'none'",
+            "ums.viewing_status != 'none'",
             limit=limit,
         )
 
