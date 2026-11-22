@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from telegram import Update
+from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
 from config import Settings
@@ -26,8 +27,22 @@ def tmdb(context: ContextTypes.DEFAULT_TYPE) -> TmdbClient:
 
 async def allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
-    configured = settings(context).allowed_chat_ids
-    if chat is not None and (not configured or chat.id in configured):
+    user = update.effective_user
+    current = settings(context)
+    configured = current.allowed_chat_ids
+
+    owner_private_chat = (
+        chat is not None
+        and chat.type == ChatType.PRIVATE
+        and user is not None
+        and user.id in current.owner_user_ids
+    )
+    configured_chat = (
+        chat is not None
+        and (not configured or chat.id in configured)
+    )
+
+    if owner_private_chat or configured_chat:
         try:
             await database(context).record_chat(
                 chat_id=chat.id,
