@@ -25,7 +25,10 @@ def tmdb(context: ContextTypes.DEFAULT_TYPE) -> TmdbClient:
     return context.application.bot_data["tmdb"]
 
 
-async def allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def allowed(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
     chat = update.effective_chat
     user = update.effective_user
     current = settings(context)
@@ -37,12 +40,14 @@ async def allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         and user is not None
         and user.id in current.owner_user_ids
     )
-    configured_chat = (
+
+    allowed_group_chat = (
         chat is not None
+        and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
         and (not configured or chat.id in configured)
     )
 
-    if owner_private_chat or configured_chat:
+    if owner_private_chat or allowed_group_chat:
         try:
             await database(context).record_chat(
                 chat_id=chat.id,
@@ -50,16 +55,28 @@ async def allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
                 title=_chat_title(update),
                 username=chat.username,
             )
+            if allowed_group_chat and user is not None:
+                await database(context).record_user_chat(
+                    chat_id=chat.id,
+                    user_id=user.id,
+                    user_name=user.full_name or user.username or str(user.id),
+                )
         except Exception:
-            LOGGER.exception("Could not record chat %s", chat.id)
+            LOGGER.exception(
+                "Could not record chat/user activity for chat %s",
+                chat.id,
+            )
         return True
 
     if update.callback_query:
         await update.callback_query.answer(
-            "This bot is not enabled in this chat.", show_alert=True
+            "This bot is not enabled in this chat.",
+            show_alert=True,
         )
     elif update.effective_message:
-        await update.effective_message.reply_text("This bot is not enabled in this chat.")
+        await update.effective_message.reply_text(
+            "This bot is not enabled in this chat."
+        )
     return False
 
 

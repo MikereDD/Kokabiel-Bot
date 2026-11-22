@@ -55,7 +55,6 @@ CREATE TABLE IF NOT EXISTS group_catalog (
 );
 
 CREATE TABLE IF NOT EXISTS user_media_state (
-    chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     media_type TEXT NOT NULL CHECK (media_type IN ('movie', 'tv')),
     tmdb_id INTEGER NOT NULL,
@@ -63,34 +62,43 @@ CREATE TABLE IF NOT EXISTS user_media_state (
     watchlist INTEGER NOT NULL DEFAULT 0 CHECK (watchlist IN (0, 1)),
     viewing_status TEXT NOT NULL DEFAULT 'none'
         CHECK (viewing_status IN ('none', 'watching', 'watched', 'caught_up', 'completed')),
+    last_chat_id INTEGER,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (chat_id, user_id, media_type, tmdb_id),
+    PRIMARY KEY (user_id, media_type, tmdb_id),
     FOREIGN KEY (media_type, tmdb_id) REFERENCES media(media_type, tmdb_id)
         ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS episode_progress (
-    chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     tmdb_id INTEGER NOT NULL,
     season_number INTEGER NOT NULL,
     episode_number INTEGER NOT NULL,
     watched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (chat_id, user_id, tmdb_id, season_number, episode_number)
+    PRIMARY KEY (user_id, tmdb_id, season_number, episode_number)
 );
 
 CREATE TABLE IF NOT EXISTS ratings (
-    chat_id INTEGER NOT NULL,
-    media_type TEXT NOT NULL,
-    tmdb_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
+    media_type TEXT NOT NULL CHECK (media_type IN ('movie', 'tv')),
+    tmdb_id INTEGER NOT NULL,
     user_name TEXT NOT NULL,
     rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 10),
     rated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (chat_id, media_type, tmdb_id, user_id),
+    PRIMARY KEY (user_id, media_type, tmdb_id),
     FOREIGN KEY (media_type, tmdb_id) REFERENCES media(media_type, tmdb_id)
         ON DELETE CASCADE
+);
+
+-- Group membership/interaction bridge. Personal media state is never keyed by chat.
+CREATE TABLE IF NOT EXISTS user_chats (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    user_name TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS suggestions (
@@ -137,13 +145,19 @@ CREATE INDEX IF NOT EXISTS idx_known_chats_type_active
 ON known_chats(chat_type, is_active, last_seen_at);
 
 CREATE INDEX IF NOT EXISTS idx_user_watchlist
-ON user_media_state(chat_id, user_id, watchlist, updated_at);
+ON user_media_state(user_id, watchlist, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_user_status
-ON user_media_state(chat_id, user_id, viewing_status, updated_at);
+ON user_media_state(user_id, viewing_status, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_episode_progress_user
-ON episode_progress(chat_id, user_id, tmdb_id, season_number);
+ON episode_progress(user_id, tmdb_id, season_number);
+
+CREATE INDEX IF NOT EXISTS idx_user_chats_chat
+ON user_chats(chat_id, user_id, last_seen_at);
+
+CREATE INDEX IF NOT EXISTS idx_ratings_media
+ON ratings(media_type, tmdb_id, user_id);
 
 CREATE INDEX IF NOT EXISTS idx_suggestions_group
 ON suggestions(chat_id, suggested_at);
@@ -165,6 +179,8 @@ class Database:
             self._ensure_media_columns(connection)
             self._migrate_legacy_group_state(connection)
             self._migrate_recommendations(connection)
+            self._migrate_global_user_state(connection)
+            self._ensure_indexes(connection)
             connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -215,6 +231,27 @@ class Database:
                               last_seen_at = CURRENT_TIMESTAMP
                 """,
                 (chat_id, chat_type, title, username),
+            )
+
+        await self._write(operation)
+
+    async def record_user_chat(
+        self,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO user_chats (
+                    chat_id, user_id, user_name
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, user_id)
+                DO UPDATE SET user_name = excluded.user_name,
+                              last_seen_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, user_id, user_name),
             )
 
         await self._write(operation)
@@ -293,15 +330,14 @@ class Database:
                 SELECT ums.watchlist, ums.viewing_status,
                        CASE WHEN ums.media_type = 'tv' THEN (
                            SELECT COUNT(*) FROM episode_progress ep
-                           WHERE ep.chat_id = ums.chat_id
-                             AND ep.user_id = ums.user_id
+                           WHERE ep.user_id = ums.user_id
                              AND ep.tmdb_id = ums.tmdb_id
                        ) ELSE 0 END AS watched_episodes
                 FROM user_media_state ums
-                WHERE ums.chat_id = ? AND ums.user_id = ?
+                WHERE ums.user_id = ?
                   AND ums.media_type = ? AND ums.tmdb_id = ?
                 """,
-                (chat_id, user_id, media_type, tmdb_id),
+                (user_id, media_type, tmdb_id),
             ).fetchone()
             if row is None:
                 return UserMediaState()
@@ -326,17 +362,18 @@ class Database:
             row = connection.execute(
                 """
                 SELECT watchlist FROM user_media_state
-                WHERE chat_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND media_type = ? AND tmdb_id = ?
                 """,
-                (chat_id, user_id, details.media_type, details.tmdb_id),
+                (user_id, details.media_type, details.tmdb_id),
             ).fetchone()
             enabled = not bool(row["watchlist"])
             connection.execute(
                 """
                 UPDATE user_media_state
-                SET watchlist = ?, user_name = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND user_id = ?
+                SET watchlist = ?, user_name = ?, last_chat_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
                   AND media_type = ? AND tmdb_id = ?
                 """,
                 (
@@ -368,10 +405,10 @@ class Database:
             row = connection.execute(
                 """
                 SELECT viewing_status FROM user_media_state
-                WHERE chat_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND media_type = 'movie' AND tmdb_id = ?
                 """,
-                (chat_id, user_id, details.tmdb_id),
+                (user_id, details.tmdb_id),
             ).fetchone()
             enabled = str(row["viewing_status"]) != "watched"
             connection.execute(
@@ -379,8 +416,9 @@ class Database:
                 UPDATE user_media_state
                 SET viewing_status = ?,
                     watchlist = CASE WHEN ? = 1 THEN 0 ELSE watchlist END,
-                    user_name = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND user_id = ?
+                    user_name = ?, last_chat_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
                   AND media_type = 'movie' AND tmdb_id = ?
                 """,
                 (
@@ -417,8 +455,9 @@ class Database:
                 UPDATE user_media_state
                 SET viewing_status = ?,
                     watchlist = CASE WHEN ? != 'none' THEN 0 ELSE watchlist END,
-                    user_name = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND user_id = ?
+                    user_name = ?, last_chat_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
                   AND media_type = 'tv' AND tmdb_id = ?
                 """,
                 (status, status, user_name, chat_id, user_id, details.tmdb_id),
@@ -466,11 +505,11 @@ class Database:
                 connection.executemany(
                     """
                     INSERT OR IGNORE INTO episode_progress (
-                        chat_id, user_id, tmdb_id, season_number, episode_number
-                    ) VALUES (?, ?, ?, ?, ?)
+                        user_id, tmdb_id, season_number, episode_number
+                    ) VALUES (?, ?, ?, ?)
                     """,
                     [
-                        (chat_id, user_id, details.tmdb_id, season, episode)
+                        (user_id, details.tmdb_id, season, episode)
                         for season, episode in keys
                     ],
                 )
@@ -478,19 +517,20 @@ class Database:
                 connection.executemany(
                     """
                     DELETE FROM episode_progress
-                    WHERE chat_id = ? AND user_id = ? AND tmdb_id = ?
+                    WHERE user_id = ? AND tmdb_id = ?
                       AND season_number = ? AND episode_number = ?
                     """,
                     [
-                        (chat_id, user_id, details.tmdb_id, season, episode)
+                        (user_id, details.tmdb_id, season, episode)
                         for season, episode in keys
                     ],
                 )
             connection.execute(
                 """
                 UPDATE user_media_state
-                SET user_name = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND user_id = ?
+                SET user_name = ?, last_chat_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
                   AND media_type = 'tv' AND tmdb_id = ?
                 """,
                 (user_name, chat_id, user_id, details.tmdb_id),
@@ -511,16 +551,18 @@ class Database:
             connection.execute(
                 """
                 DELETE FROM episode_progress
-                WHERE chat_id = ? AND user_id = ? AND tmdb_id = ?
+                WHERE user_id = ? AND tmdb_id = ?
                 """,
-                (chat_id, user_id, details.tmdb_id),
+                (user_id, details.tmdb_id),
             )
             connection.execute(
                 """
                 UPDATE user_media_state
-                SET viewing_status = 'none', user_name = ?,
+                SET viewing_status = 'none',
+                    user_name = ?,
+                    last_chat_id = ?,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND media_type = 'tv' AND tmdb_id = ?
                 """,
                 (user_name, chat_id, user_id, details.tmdb_id),
@@ -536,9 +578,9 @@ class Database:
                 """
                 SELECT season_number, episode_number
                 FROM episode_progress
-                WHERE chat_id = ? AND user_id = ? AND tmdb_id = ?
+                WHERE user_id = ? AND tmdb_id = ?
                 """,
-                (chat_id, user_id, tmdb_id),
+                (user_id, tmdb_id),
             ).fetchall()
             return {
                 (int(row["season_number"]), int(row["episode_number"]))
@@ -564,9 +606,9 @@ class Database:
                 """
                 SELECT season_number, episode_number
                 FROM episode_progress
-                WHERE chat_id = ? AND user_id = ? AND tmdb_id = ?
+                WHERE user_id = ? AND tmdb_id = ?
                 """,
-                (chat_id, user_id, details.tmdb_id),
+                (user_id, details.tmdb_id),
             ).fetchall()
             watched = {
                 (int(row["season_number"]), int(row["episode_number"]))
@@ -579,24 +621,34 @@ class Database:
                 status = "caught_up" if details.series_status == "ongoing" else "completed"
             else:
                 status = "watching"
+
             connection.execute(
                 """
                 UPDATE user_media_state
                 SET viewing_status = ?,
                     watchlist = CASE WHEN ? != 'none' THEN 0 ELSE watchlist END,
-                    user_name = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND user_id = ?
+                    user_name = ?,
+                    last_chat_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
                   AND media_type = 'tv' AND tmdb_id = ?
                 """,
-                (status, status, user_name, chat_id, user_id, details.tmdb_id),
+                (
+                    status,
+                    status,
+                    user_name,
+                    chat_id,
+                    user_id,
+                    details.tmdb_id,
+                ),
             )
             row = connection.execute(
                 """
                 SELECT watchlist FROM user_media_state
-                WHERE chat_id = ? AND user_id = ?
+                WHERE user_id = ?
                   AND media_type = 'tv' AND tmdb_id = ?
                 """,
-                (chat_id, user_id, details.tmdb_id),
+                (user_id, details.tmdb_id),
             ).fetchone()
             return UserMediaState(
                 watchlist=bool(row["watchlist"]),
@@ -614,12 +666,15 @@ class Database:
                 """
                 SELECT season_number, COUNT(*) AS count
                 FROM episode_progress
-                WHERE chat_id = ? AND user_id = ? AND tmdb_id = ?
+                WHERE user_id = ? AND tmdb_id = ?
                 GROUP BY season_number
                 """,
-                (chat_id, user_id, tmdb_id),
+                (user_id, tmdb_id),
             ).fetchall()
-            return {int(row["season_number"]): int(row["count"]) for row in rows}
+            return {
+                int(row["season_number"]): int(row["count"])
+                for row in rows
+            }
 
         return await self._read(operation)
 
@@ -643,14 +698,21 @@ class Database:
             connection.execute(
                 """
                 INSERT INTO ratings (
-                    chat_id, media_type, tmdb_id, user_id, user_name, rating, rated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(chat_id, media_type, tmdb_id, user_id)
+                    user_id, media_type, tmdb_id,
+                    user_name, rating, rated_at
+                ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, media_type, tmdb_id)
                 DO UPDATE SET user_name = excluded.user_name,
                               rating = excluded.rating,
                               rated_at = CURRENT_TIMESTAMP
                 """,
-                (chat_id, details.media_type, details.tmdb_id, user_id, user_name, rating),
+                (
+                    user_id,
+                    details.media_type,
+                    details.tmdb_id,
+                    user_name,
+                    rating,
+                ),
             )
 
         await self._write(operation)
@@ -698,9 +760,13 @@ class Database:
         def operation(connection: sqlite3.Connection) -> tuple[float | None, int]:
             row = connection.execute(
                 """
-                SELECT AVG(rating) AS average, COUNT(*) AS count
-                FROM ratings
-                WHERE chat_id = ? AND media_type = ? AND tmdb_id = ?
+                SELECT AVG(r.rating) AS average, COUNT(*) AS count
+                FROM ratings r
+                JOIN user_chats uc
+                  ON uc.user_id = r.user_id
+                WHERE uc.chat_id = ?
+                  AND r.media_type = ?
+                  AND r.tmdb_id = ?
                 """,
                 (chat_id, media_type, tmdb_id),
             ).fetchone()
@@ -751,18 +817,18 @@ class Database:
         def operation(connection: sqlite3.Connection) -> list[PersonalEntry]:
             rows = connection.execute(
                 f"""
-                SELECT ums.chat_id, ums.user_id, ums.media_type, ums.tmdb_id,
+                SELECT COALESCE(ums.last_chat_id, ?) AS chat_id,
+                       ums.user_id, ums.media_type, ums.tmdb_id,
                        m.title, m.year, m.poster_url, m.media_class,
                        ums.watchlist, ums.viewing_status, ums.updated_at,
                        CASE WHEN ums.media_type = 'tv' THEN (
                            SELECT COUNT(*) FROM episode_progress ep
-                           WHERE ep.chat_id = ums.chat_id
-                             AND ep.user_id = ums.user_id
+                           WHERE ep.user_id = ums.user_id
                              AND ep.tmdb_id = ums.tmdb_id
                        ) ELSE 0 END AS watched_episodes
                 FROM user_media_state ums
                 JOIN media m USING (media_type, tmdb_id)
-                WHERE ums.chat_id = ? AND ums.user_id = ? AND {where}
+                WHERE ums.user_id = ? AND {where}
                 ORDER BY ums.updated_at DESC
                 LIMIT ?
                 """,
@@ -778,26 +844,32 @@ class Database:
         def operation(connection: sqlite3.Connection) -> list[GroupEntry]:
             rows = connection.execute(
                 """
-                SELECT ums.chat_id, ums.media_type, ums.tmdb_id,
+                SELECT uc.chat_id, ums.media_type, ums.tmdb_id,
                        m.title, m.year, m.poster_url, m.media_class,
                        COUNT(DISTINCT ums.user_id) AS member_count,
-                       GROUP_CONCAT(DISTINCT ums.user_name) AS member_names,
+                       GROUP_CONCAT(DISTINCT uc.user_name) AS member_names,
                        rating.average AS group_rating,
                        COALESCE(rating.count, 0) AS rating_count,
                        MAX(ums.updated_at) AS newest
-                FROM user_media_state ums
+                FROM user_chats uc
+                JOIN user_media_state ums
+                  ON ums.user_id = uc.user_id
                 JOIN media m USING (media_type, tmdb_id)
                 LEFT JOIN (
-                    SELECT chat_id, media_type, tmdb_id,
-                           AVG(rating) AS average, COUNT(*) AS count
-                    FROM ratings
-                    GROUP BY chat_id, media_type, tmdb_id
+                    SELECT uc2.chat_id, r.media_type, r.tmdb_id,
+                           AVG(r.rating) AS average,
+                           COUNT(*) AS count
+                    FROM user_chats uc2
+                    JOIN ratings r
+                      ON r.user_id = uc2.user_id
+                    GROUP BY uc2.chat_id, r.media_type, r.tmdb_id
                 ) rating
-                  ON rating.chat_id = ums.chat_id
+                  ON rating.chat_id = uc.chat_id
                  AND rating.media_type = ums.media_type
                  AND rating.tmdb_id = ums.tmdb_id
-                WHERE ums.chat_id = ? AND ums.watchlist = 1
-                GROUP BY ums.chat_id, ums.media_type, ums.tmdb_id
+                WHERE uc.chat_id = ?
+                  AND ums.watchlist = 1
+                GROUP BY uc.chat_id, ums.media_type, ums.tmdb_id
                 ORDER BY member_count DESC, newest DESC
                 LIMIT ?
                 """,
@@ -878,6 +950,44 @@ class Database:
                 connection.execute(f"ALTER TABLE media ADD COLUMN {name} {definition}")
 
     @staticmethod
+    def _ensure_indexes(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_known_chats_type_active
+            ON known_chats(chat_type, is_active, last_seen_at);
+
+            CREATE INDEX IF NOT EXISTS idx_user_watchlist
+            ON user_media_state(user_id, watchlist, updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_user_status
+            ON user_media_state(user_id, viewing_status, updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_episode_progress_user
+            ON episode_progress(user_id, tmdb_id, season_number);
+
+            CREATE INDEX IF NOT EXISTS idx_user_chats_chat
+            ON user_chats(chat_id, user_id, last_seen_at);
+
+            CREATE INDEX IF NOT EXISTS idx_ratings_media
+            ON ratings(media_type, tmdb_id, user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_suggestions_group
+            ON suggestions(chat_id, suggested_at);
+            """
+        )
+
+    @staticmethod
+    def _table_columns(
+        connection: sqlite3.Connection, table_name: str
+    ) -> set[str]:
+        return {
+            str(row["name"])
+            for row in connection.execute(
+                f"PRAGMA table_info({table_name})"
+            ).fetchall()
+        }
+
+    @staticmethod
     def _migration_applied(connection: sqlite3.Connection, name: str) -> bool:
         row = connection.execute(
             "SELECT 1 FROM schema_migrations WHERE name = ?", (name,)
@@ -891,10 +1001,308 @@ class Database:
         )
 
     @classmethod
-    def _migrate_legacy_group_state(cls, connection: sqlite3.Connection) -> None:
+    def _migrate_global_user_state(cls, connection: sqlite3.Connection) -> None:
+        migration = "personal_state_global_by_user_v1"
+        if cls._migration_applied(connection, migration):
+            return
+
+        state_columns = cls._table_columns(connection, "user_media_state")
+        episode_columns = cls._table_columns(connection, "episode_progress")
+        rating_columns = cls._table_columns(connection, "ratings")
+
+        state_is_legacy = "chat_id" in state_columns
+        episode_is_legacy = "chat_id" in episode_columns
+        ratings_are_legacy = "chat_id" in rating_columns
+
+        # Preserve group membership/interaction knowledge before chat_id is
+        # removed from personal state.
+        if state_is_legacy:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO user_chats (
+                    chat_id, user_id, user_name, first_seen_at, last_seen_at
+                )
+                SELECT
+                    ums.chat_id,
+                    ums.user_id,
+                    MAX(ums.user_name),
+                    MIN(ums.created_at),
+                    MAX(ums.updated_at)
+                FROM user_media_state ums
+                JOIN known_chats kc ON kc.chat_id = ums.chat_id
+                WHERE kc.chat_type IN ('group', 'supergroup')
+                GROUP BY ums.chat_id, ums.user_id
+                """
+            )
+
+        if ratings_are_legacy:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO user_chats (
+                    chat_id, user_id, user_name, first_seen_at, last_seen_at
+                )
+                SELECT
+                    r.chat_id,
+                    r.user_id,
+                    MAX(r.user_name),
+                    MIN(r.rated_at),
+                    MAX(r.rated_at)
+                FROM ratings r
+                JOIN known_chats kc ON kc.chat_id = r.chat_id
+                WHERE kc.chat_type IN ('group', 'supergroup')
+                GROUP BY r.chat_id, r.user_id
+                """
+            )
+
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO user_chats (
+                chat_id, user_id, user_name, first_seen_at, last_seen_at
+            )
+            SELECT
+                s.chat_id,
+                s.user_id,
+                MAX(s.user_name),
+                MIN(s.suggested_at),
+                MAX(s.suggested_at)
+            FROM suggestions s
+            JOIN known_chats kc ON kc.chat_id = s.chat_id
+            WHERE kc.chat_type IN ('group', 'supergroup')
+            GROUP BY s.chat_id, s.user_id
+            """
+        )
+
+        if state_is_legacy:
+            connection.execute(
+                """
+                CREATE TABLE user_media_state_v2 (
+                    user_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL
+                        CHECK (media_type IN ('movie', 'tv')),
+                    tmdb_id INTEGER NOT NULL,
+                    user_name TEXT NOT NULL,
+                    watchlist INTEGER NOT NULL DEFAULT 0
+                        CHECK (watchlist IN (0, 1)),
+                    viewing_status TEXT NOT NULL DEFAULT 'none'
+                        CHECK (
+                            viewing_status IN (
+                                'none', 'watching', 'watched',
+                                'caught_up', 'completed'
+                            )
+                        ),
+                    last_chat_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, media_type, tmdb_id),
+                    FOREIGN KEY (media_type, tmdb_id)
+                        REFERENCES media(media_type, tmdb_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+
+            connection.execute(
+                """
+                WITH merged AS (
+                    SELECT
+                        user_id,
+                        media_type,
+                        tmdb_id,
+                        MAX(watchlist) AS any_watchlist,
+                        CASE
+                            WHEN media_type = 'movie'
+                                 AND MAX(
+                                     CASE WHEN viewing_status = 'watched'
+                                          THEN 1 ELSE 0 END
+                                 ) = 1
+                                THEN 'watched'
+                            WHEN media_type = 'tv'
+                                 AND MAX(
+                                     CASE WHEN viewing_status = 'completed'
+                                          THEN 1 ELSE 0 END
+                                 ) = 1
+                                THEN 'completed'
+                            WHEN media_type = 'tv'
+                                 AND MAX(
+                                     CASE WHEN viewing_status = 'caught_up'
+                                          THEN 1 ELSE 0 END
+                                 ) = 1
+                                THEN 'caught_up'
+                            WHEN media_type = 'tv'
+                                 AND MAX(
+                                     CASE WHEN viewing_status = 'watching'
+                                          THEN 1 ELSE 0 END
+                                 ) = 1
+                                THEN 'watching'
+                            ELSE 'none'
+                        END AS merged_status,
+                        MIN(created_at) AS created_at,
+                        MAX(updated_at) AS updated_at
+                    FROM user_media_state
+                    GROUP BY user_id, media_type, tmdb_id
+                )
+                INSERT INTO user_media_state_v2 (
+                    user_id,
+                    media_type,
+                    tmdb_id,
+                    user_name,
+                    watchlist,
+                    viewing_status,
+                    last_chat_id,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    m.user_id,
+                    m.media_type,
+                    m.tmdb_id,
+                    (
+                        SELECT s.user_name
+                        FROM user_media_state s
+                        WHERE s.user_id = m.user_id
+                          AND s.media_type = m.media_type
+                          AND s.tmdb_id = m.tmdb_id
+                        ORDER BY s.updated_at DESC, s.chat_id DESC
+                        LIMIT 1
+                    ),
+                    CASE
+                        WHEN m.merged_status = 'none'
+                            THEN m.any_watchlist
+                        ELSE 0
+                    END,
+                    m.merged_status,
+                    (
+                        SELECT s.chat_id
+                        FROM user_media_state s
+                        WHERE s.user_id = m.user_id
+                          AND s.media_type = m.media_type
+                          AND s.tmdb_id = m.tmdb_id
+                        ORDER BY s.updated_at DESC, s.chat_id DESC
+                        LIMIT 1
+                    ),
+                    m.created_at,
+                    m.updated_at
+                FROM merged m
+                """
+            )
+
+            connection.execute("DROP TABLE user_media_state")
+            connection.execute(
+                "ALTER TABLE user_media_state_v2 RENAME TO user_media_state"
+            )
+
+        if episode_is_legacy:
+            connection.execute(
+                """
+                CREATE TABLE episode_progress_v2 (
+                    user_id INTEGER NOT NULL,
+                    tmdb_id INTEGER NOT NULL,
+                    season_number INTEGER NOT NULL,
+                    episode_number INTEGER NOT NULL,
+                    watched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (
+                        user_id, tmdb_id, season_number, episode_number
+                    )
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO episode_progress_v2 (
+                    user_id,
+                    tmdb_id,
+                    season_number,
+                    episode_number,
+                    watched_at
+                )
+                SELECT
+                    user_id,
+                    tmdb_id,
+                    season_number,
+                    episode_number,
+                    MAX(watched_at)
+                FROM episode_progress
+                GROUP BY
+                    user_id,
+                    tmdb_id,
+                    season_number,
+                    episode_number
+                """
+            )
+            connection.execute("DROP TABLE episode_progress")
+            connection.execute(
+                "ALTER TABLE episode_progress_v2 RENAME TO episode_progress"
+            )
+
+        if ratings_are_legacy:
+            connection.execute(
+                """
+                CREATE TABLE ratings_v2 (
+                    user_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL
+                        CHECK (media_type IN ('movie', 'tv')),
+                    tmdb_id INTEGER NOT NULL,
+                    user_name TEXT NOT NULL,
+                    rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 10),
+                    rated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, media_type, tmdb_id),
+                    FOREIGN KEY (media_type, tmdb_id)
+                        REFERENCES media(media_type, tmdb_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO ratings_v2 (
+                    user_id,
+                    media_type,
+                    tmdb_id,
+                    user_name,
+                    rating,
+                    rated_at
+                )
+                SELECT
+                    r.user_id,
+                    r.media_type,
+                    r.tmdb_id,
+                    r.user_name,
+                    r.rating,
+                    r.rated_at
+                FROM ratings r
+                WHERE r.rowid = (
+                    SELECT r2.rowid
+                    FROM ratings r2
+                    WHERE r2.user_id = r.user_id
+                      AND r2.media_type = r.media_type
+                      AND r2.tmdb_id = r.tmdb_id
+                    ORDER BY r2.rated_at DESC, r2.rowid DESC
+                    LIMIT 1
+                )
+                """
+            )
+            connection.execute("DROP TABLE ratings")
+            connection.execute("ALTER TABLE ratings_v2 RENAME TO ratings")
+
+        cls._mark_migration(connection, migration)
+
+    @classmethod
+    def _migrate_legacy_group_state(
+        cls, connection: sqlite3.Connection
+    ) -> None:
         migration = "legacy_group_catalog_to_personal_v1"
         if cls._migration_applied(connection, migration):
             return
+
+        # New installations already use global user state. group_catalog is
+        # retained only for compatibility with databases created by older
+        # Kokabiel versions.
+        if "chat_id" not in cls._table_columns(
+            connection, "user_media_state"
+        ):
+            cls._mark_migration(connection, migration)
+            return
+
         connection.execute(
             """
             INSERT OR IGNORE INTO user_media_state (
@@ -972,12 +1380,20 @@ class Database:
         connection.execute(
             """
             INSERT INTO user_media_state (
-                chat_id, user_id, media_type, tmdb_id, user_name
+                user_id, media_type, tmdb_id,
+                user_name, last_chat_id
             ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id, user_id, media_type, tmdb_id)
-            DO UPDATE SET user_name = excluded.user_name
+            ON CONFLICT(user_id, media_type, tmdb_id)
+            DO UPDATE SET user_name = excluded.user_name,
+                          last_chat_id = excluded.last_chat_id
             """,
-            (chat_id, user_id, details.media_type, details.tmdb_id, user_name),
+            (
+                user_id,
+                details.media_type,
+                details.tmdb_id,
+                user_name,
+                chat_id,
+            ),
         )
 
     @staticmethod
