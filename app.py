@@ -5,7 +5,13 @@ from datetime import datetime, timezone
 
 import aiohttp
 from telegram import BotCommand
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from config import ConfigError, load_settings
 from database import Database
@@ -27,6 +33,10 @@ from handlers.commands import (
     watchlist,
 )
 from handlers.errors import error_handler
+from handlers.imports import (
+    import_command,
+    receive_import_document,
+)
 from handlers.owner import (
     adminhelp,
     groups,
@@ -69,6 +79,11 @@ COMMANDS = [
     BotCommand(
         "mysuggestions",
         "Show your suggestions",
+        api_kwargs={"is_ephemeral": True},
+    ),
+    BotCommand(
+        "import",
+        "Import tracker data privately",
         api_kwargs={"is_ephemeral": True},
     ),
     BotCommand("random", "Pick from the group watchlist"),
@@ -139,6 +154,15 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("suggestions", suggestions))
     application.add_handler(CommandHandler("mysuggestions", mysuggestions))
     application.add_handler(CommandHandler("random", random_pick))
+    application.add_handler(CommandHandler("import", import_command))
+
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.Document.ALL,
+            receive_import_document,
+        )
+    )
 
     application.add_handler(CommandHandler("adminhelp", adminhelp))
     application.add_handler(CommandHandler("whoami", whoami))

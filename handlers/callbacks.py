@@ -20,6 +20,7 @@ from handlers.common import (
     tmdb,
     user_identity,
 )
+from handlers.imports import import_callback_router
 from handlers.owner import owner_callback_router
 from keyboards import (
     EPISODE_PAGE_SIZE,
@@ -46,6 +47,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     if data.startswith("own|"):
         await owner_callback_router(update, context)
+        return
+
+    if data.startswith("imp|"):
+        await import_callback_router(update, context)
         return
 
     if not await allowed(update, context):
