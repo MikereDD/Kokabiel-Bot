@@ -19,6 +19,14 @@ ImportedMediaType = Literal[
     "unknown",
 ]
 
+ImportStatus = Literal[
+    "watching",
+    "completed",
+    "plan_to_watch",
+    "dropped",
+    "on_hold",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class NormalizedImportRecord:
@@ -41,6 +49,7 @@ class NormalizedImportRecord:
     watched_at: str | None = None
 
     watchlist: bool = False
+    status: ImportStatus | None = None
 
     rating: float | None = None
     rated_at: str | None = None
