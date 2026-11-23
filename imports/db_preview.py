@@ -13,6 +13,11 @@ from imports.resolve import (
 from models import MediaType, ViewingStatus
 
 
+MediaAction = Literal[
+    "none",
+    "add",
+]
+
 StateAction = Literal[
     "none",
     "add",
@@ -59,6 +64,9 @@ class ExistingUserSnapshot:
         int,
         frozenset[tuple[int, int]],
     ]
+    media: frozenset[
+        tuple[MediaType, int]
+    ] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +83,7 @@ class ImportDbPreviewItem:
     media_type: MediaType | None
     tmdb_id: int | None
 
+    media_action: MediaAction
     state_action: StateAction
     before_watchlist: bool
     after_watchlist: bool
@@ -102,7 +111,8 @@ class ImportDbPreviewItem:
     @property
     def has_changes(self) -> bool:
         return (
-            self.state_action != "none"
+            self.media_action != "none"
+            or self.state_action != "none"
             or bool(self.episode_additions)
             or self.rating_action == "add"
         )
@@ -114,6 +124,13 @@ class ImportDatabasePreview:
     user_id: int
     raw_record_count: int
     items: tuple[ImportDbPreviewItem, ...]
+
+    @property
+    def media_add_count(self) -> int:
+        return sum(
+            item.media_action == "add"
+            for item in self.items
+        )
 
     @property
     def state_add_count(self) -> int:
@@ -159,39 +176,21 @@ class ImportDatabasePreview:
         )
 
 
-def load_existing_user_snapshot(
-    database_path: str | Path,
+def snapshot_from_connection(
+    connection: sqlite3.Connection,
     user_id: int,
 ) -> ExistingUserSnapshot:
     """
-    Read Kokabiel state using a SQLite read-only connection.
+    Read one user's current import-relevant state from an existing connection.
 
-    The database must already exist. This function cannot create, modify,
-    migrate or commit database content.
+    Callers may use this inside an already-open transaction so preview
+    validation and subsequent writes observe the same locked database state.
     """
 
-    path = Path(database_path).resolve()
-
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Kokabiel database does not exist: {path}"
-        )
-
-    uri = f"{path.as_uri()}?mode=ro"
-
-    connection = sqlite3.connect(
-        uri,
-        uri=True,
-        timeout=10,
-    )
+    previous_factory = connection.row_factory
     connection.row_factory = sqlite3.Row
 
     try:
-        connection.execute(
-            "PRAGMA query_only = ON"
-        )
-        connection.execute("BEGIN")
-
         state_rows = connection.execute(
             """
             SELECT
@@ -231,10 +230,15 @@ def load_existing_user_snapshot(
             (user_id,),
         ).fetchall()
 
-        connection.rollback()
+        media_rows = connection.execute(
+            """
+            SELECT media_type, tmdb_id
+            FROM media
+            """
+        ).fetchall()
 
     finally:
-        connection.close()
+        connection.row_factory = previous_factory
 
     states: dict[
         tuple[MediaType, int],
@@ -323,12 +327,79 @@ def load_existing_user_snapshot(
         in episode_sets.items()
     }
 
+    media: set[
+        tuple[MediaType, int]
+    ] = set()
+
+    for row in media_rows:
+        media_type = str(
+            row["media_type"]
+        )
+
+        if media_type not in {
+            "movie",
+            "tv",
+        }:
+            continue
+
+        media.add(
+            (
+                media_type,
+                int(row["tmdb_id"]),
+            )
+        )
+
     return ExistingUserSnapshot(
         user_id=user_id,
         states=states,
         ratings=ratings,
         episodes=episodes,
+        media=frozenset(media),
     )
+
+
+def load_existing_user_snapshot(
+    database_path: str | Path,
+    user_id: int,
+) -> ExistingUserSnapshot:
+    """
+    Read Kokabiel state using a SQLite read-only connection.
+
+    The database must already exist. This function cannot create, modify,
+    migrate or commit database content.
+    """
+
+    path = Path(database_path).resolve()
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Kokabiel database does not exist: {path}"
+        )
+
+    uri = f"{path.as_uri()}?mode=ro"
+
+    connection = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=10,
+    )
+
+    try:
+        connection.execute(
+            "PRAGMA query_only = ON"
+        )
+        connection.execute("BEGIN")
+
+        snapshot = snapshot_from_connection(
+            connection,
+            user_id,
+        )
+
+        connection.rollback()
+        return snapshot
+
+    finally:
+        connection.close()
 
 
 def preview_database_import(
@@ -374,14 +445,39 @@ def build_database_preview(
             + 1
         )
 
-    items = tuple(
-        _preview_item(
+    working_snapshot = ExistingUserSnapshot(
+        user_id=snapshot.user_id,
+        states=dict(snapshot.states),
+        ratings=dict(snapshot.ratings),
+        episodes=dict(snapshot.episodes),
+        media=frozenset(snapshot.media),
+    )
+
+    planned_items: list[
+        ImportDbPreviewItem
+    ] = []
+
+    for item in resolution.items:
+        planned = _preview_item(
             item,
-            snapshot,
+            working_snapshot,
             canonical_counts,
         )
-        for item in resolution.items
-    )
+
+        planned_items.append(
+            planned
+        )
+
+        # Simulate only changes that could actually be approved. This keeps
+        # subsequent records in the same import from planning duplicate media
+        # rows, user-state rows, ratings or episode keys.
+        if not planned.needs_review:
+            working_snapshot = (
+                _snapshot_after_preview_item(
+                    working_snapshot,
+                    planned,
+                )
+            )
 
     return ImportDatabasePreview(
         source=resolution.source,
@@ -389,7 +485,85 @@ def build_database_preview(
         raw_record_count=(
             resolution.raw_record_count
         ),
-        items=items,
+        items=tuple(planned_items),
+    )
+
+
+def _snapshot_after_preview_item(
+    snapshot: ExistingUserSnapshot,
+    item: ImportDbPreviewItem,
+) -> ExistingUserSnapshot:
+    if (
+        item.media_type is None
+        or item.tmdb_id is None
+    ):
+        return snapshot
+
+    key = (
+        item.media_type,
+        item.tmdb_id,
+    )
+
+    states = dict(
+        snapshot.states
+    )
+    ratings = dict(
+        snapshot.ratings
+    )
+    episodes = dict(
+        snapshot.episodes
+    )
+    media = set(
+        snapshot.media
+    )
+
+    if item.media_action == "add":
+        media.add(key)
+
+    if item.state_action != "none":
+        previous = states.get(key)
+
+        states[key] = ExistingPersonalState(
+            watchlist=item.after_watchlist,
+            viewing_status=item.after_status,
+            updated_at=(
+                previous.updated_at
+                if previous is not None
+                else "<planned>"
+            ),
+        )
+
+    if item.episode_additions:
+        existing = set(
+            episodes.get(
+                item.tmdb_id,
+                frozenset(),
+            )
+        )
+
+        existing.update(
+            item.episode_additions
+        )
+
+        episodes[item.tmdb_id] = (
+            frozenset(existing)
+        )
+
+    if (
+        item.rating_action == "add"
+        and item.proposed_rating is not None
+    ):
+        ratings[key] = ExistingRating(
+            rating=item.proposed_rating,
+            rated_at="<planned>",
+        )
+
+    return ExistingUserSnapshot(
+        user_id=snapshot.user_id,
+        states=states,
+        ratings=ratings,
+        episodes=episodes,
+        media=frozenset(media),
     )
 
 
@@ -665,10 +839,30 @@ def _preview_item(
                         )
                     )
 
+    requires_catalog = (
+        state_action != "none"
+        or bool(episode_additions)
+        or rating_action == "add"
+    )
+
+    catalog_exists = (
+        state_key in snapshot.media
+        or state_key in snapshot.states
+        or state_key in snapshot.ratings
+    )
+
+    media_action: MediaAction = (
+        "add"
+        if requires_catalog
+        and not catalog_exists
+        else "none"
+    )
+
     return ImportDbPreviewItem(
         resolution=item,
         media_type=media_type,
         tmdb_id=tmdb_id,
+        media_action=media_action,
         state_action=state_action,
         before_watchlist=before_watchlist,
         after_watchlist=after_watchlist,
@@ -899,6 +1093,7 @@ def _empty_preview_item(
         resolution=item,
         media_type=media_type,
         tmdb_id=tmdb_id,
+        media_action="none",
         state_action="none",
         before_watchlist=False,
         after_watchlist=False,

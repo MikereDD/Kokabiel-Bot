@@ -89,6 +89,71 @@ def preview(
 class ImportDatabasePreviewTests(
     unittest.TestCase
 ):
+    def test_new_state_reports_required_media_catalog_insert(self):
+        result = preview(
+            resolved_item(
+                NormalizedImportRecord(
+                    source="imdb",
+                    media_type="movie",
+                    title="Alien",
+                    year=1979,
+                    watched=True,
+                ),
+                media_type="movie",
+                tmdb_id=348,
+            )
+        )
+
+        item = result.items[0]
+
+        self.assertEqual(
+            item.media_action,
+            "add",
+        )
+        self.assertEqual(
+            result.media_add_count,
+            1,
+        )
+
+    def test_existing_catalog_row_avoids_media_insert(self):
+        snapshot = ExistingUserSnapshot(
+            user_id=1,
+            states={},
+            ratings={},
+            episodes={},
+            media=frozenset(
+                {
+                    ("movie", 348),
+                }
+            ),
+        )
+
+        result = preview(
+            resolved_item(
+                NormalizedImportRecord(
+                    source="imdb",
+                    media_type="movie",
+                    title="Alien",
+                    year=1979,
+                    watched=True,
+                ),
+                media_type="movie",
+                tmdb_id=348,
+            ),
+            snapshot,
+        )
+
+        item = result.items[0]
+
+        self.assertEqual(
+            item.media_action,
+            "none",
+        )
+        self.assertEqual(
+            item.state_action,
+            "add",
+        )
+
     def test_new_watched_movie_adds_state(self):
         result = preview(
             resolved_item(
@@ -276,6 +341,93 @@ class ImportDatabasePreviewTests(
         )
         self.assertFalse(
             item.after_watchlist
+        )
+
+    def test_multiple_new_episodes_share_one_media_and_state_insert(self):
+        first = resolved_item(
+            NormalizedImportRecord(
+                source="trakt",
+                media_type="episode",
+                title="Example",
+                season=1,
+                episode=1,
+                watched=True,
+            ),
+            media_type="tv",
+            tmdb_id=200,
+        )
+
+        second = resolved_item(
+            NormalizedImportRecord(
+                source="trakt",
+                media_type="episode",
+                title="Example",
+                season=1,
+                episode=2,
+                watched=True,
+            ),
+            media_type="tv",
+            tmdb_id=200,
+        )
+
+        result = build_database_preview(
+            ResolutionPreview(
+                source="trakt",
+                raw_record_count=2,
+                items=(
+                    first,
+                    second,
+                ),
+            ),
+            ExistingUserSnapshot(
+                user_id=1,
+                states={},
+                ratings={},
+                episodes={},
+                media=frozenset(),
+            ),
+        )
+
+        first_plan = result.items[0]
+        second_plan = result.items[1]
+
+        self.assertEqual(
+            first_plan.media_action,
+            "add",
+        )
+        self.assertEqual(
+            first_plan.state_action,
+            "add",
+        )
+        self.assertEqual(
+            first_plan.episode_additions,
+            ((1, 1),),
+        )
+
+        self.assertEqual(
+            second_plan.media_action,
+            "none",
+        )
+        self.assertEqual(
+            second_plan.state_action,
+            "none",
+        )
+        self.assertEqual(
+            second_plan.episode_additions,
+            ((1, 2),),
+        )
+
+        self.assertEqual(
+            result.media_add_count,
+            1,
+        )
+        self.assertEqual(
+            result.state_add_count,
+            1,
+        )
+        self.assertEqual(
+            result.episode_add_count,
+            2,
         )
 
     def test_exact_episode_history_is_union_only(self):
@@ -615,6 +767,17 @@ class SnapshotReadOnlyTests(
 
             connection.executescript(
                 """
+                CREATE TABLE media (
+                    media_type TEXT NOT NULL,
+                    tmdb_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    year TEXT NOT NULL,
+                    PRIMARY KEY (
+                        media_type,
+                        tmdb_id
+                    )
+                );
+
                 CREATE TABLE user_media_state (
                     user_id INTEGER NOT NULL,
                     media_type TEXT NOT NULL,
@@ -658,6 +821,12 @@ class SnapshotReadOnlyTests(
                         season_number,
                         episode_number
                     )
+                );
+
+                INSERT INTO media
+                VALUES (
+                    'tv', 200,
+                    'Example', '2020'
                 );
 
                 INSERT INTO user_media_state
@@ -704,6 +873,11 @@ class SnapshotReadOnlyTests(
             self.assertEqual(
                 before,
                 after,
+            )
+
+            self.assertIn(
+                ("tv", 200),
+                snapshot.media,
             )
 
             self.assertEqual(
