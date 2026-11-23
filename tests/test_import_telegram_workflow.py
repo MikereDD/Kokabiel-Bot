@@ -5,7 +5,7 @@ import unittest
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram.constants import ChatType
 
@@ -16,8 +16,10 @@ from handlers.imports import (
     _quarantine_path,
     _safe_upload_suffix,
     format_import_preview,
+    import_callback_router,
     import_command,
     import_preview_keyboard,
+    receive_import_document,
 )
 
 
@@ -311,6 +313,522 @@ class ImportTelegramWorkflowAsyncTests(
             pending.chat_id,
             123,
         )
+
+
+class ImportTelegramApprovalTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    def callback_update(
+        self,
+        data,
+    ):
+        query = SimpleNamespace(
+            data=data,
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(
+                id=123,
+                type=ChatType.PRIVATE,
+            ),
+            effective_user=SimpleNamespace(
+                id=123,
+                full_name="Mike",
+                username=None,
+            ),
+        )
+
+        return update, query
+
+    async def test_wrong_token_never_reaches_writer(self):
+        pending = PendingImport(
+            token="deadbeef",
+            user_id=123,
+            user_name="Mike",
+            chat_id=123,
+            state="ready",
+            preview=preview(),
+        )
+
+        context = SimpleNamespace(
+            user_data={
+                IMPORT_SESSION_KEY: pending
+            }
+        )
+
+        update, query = (
+            self.callback_update(
+                "imp|apply|badtoken"
+            )
+        )
+
+        writer = MagicMock()
+
+        with (
+            patch(
+                "handlers.imports.allowed",
+                new=AsyncMock(
+                    return_value=True
+                ),
+            ),
+            patch(
+                "handlers.imports.apply_database_import",
+                new=writer,
+            ),
+        ):
+            await import_callback_router(
+                update,
+                context,
+            )
+
+        writer.assert_not_called()
+
+        self.assertIs(
+            context.user_data[
+                IMPORT_SESSION_KEY
+            ],
+            pending,
+        )
+
+        self.assertTrue(
+            query.answer.await_args.kwargs[
+                "show_alert"
+            ]
+        )
+
+    async def test_review_action_never_reaches_writer(self):
+        pending = PendingImport(
+            token="deadbeef",
+            user_id=123,
+            user_name="Mike",
+            chat_id=123,
+            state="ready",
+            preview=preview(
+                review_count=1
+            ),
+        )
+
+        context = SimpleNamespace(
+            user_data={
+                IMPORT_SESSION_KEY: pending
+            }
+        )
+
+        update, query = (
+            self.callback_update(
+                "imp|review|deadbeef"
+            )
+        )
+
+        writer = MagicMock()
+
+        with (
+            patch(
+                "handlers.imports.allowed",
+                new=AsyncMock(
+                    return_value=True
+                ),
+            ),
+            patch(
+                "handlers.imports.apply_database_import",
+                new=writer,
+            ),
+        ):
+            await import_callback_router(
+                update,
+                context,
+            )
+
+        writer.assert_not_called()
+
+        self.assertIn(
+            IMPORT_SESSION_KEY,
+            context.user_data,
+        )
+
+        self.assertTrue(
+            query.answer.await_args.kwargs[
+                "show_alert"
+            ]
+        )
+
+    async def test_cancel_deletes_pending_upload_and_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            upload = (
+                Path(temp)
+                / "raw.csv"
+            )
+
+            upload.write_text(
+                "sensitive"
+            )
+
+            pending = PendingImport(
+                token="deadbeef",
+                user_id=123,
+                user_name="Mike",
+                chat_id=123,
+                state="ready",
+                path=upload,
+                preview=preview(),
+            )
+
+            context = SimpleNamespace(
+                user_data={
+                    IMPORT_SESSION_KEY: pending
+                }
+            )
+
+            update, query = (
+                self.callback_update(
+                    "imp|cancel|deadbeef"
+                )
+            )
+
+            with patch(
+                "handlers.imports.allowed",
+                new=AsyncMock(
+                    return_value=True
+                ),
+            ):
+                await import_callback_router(
+                    update,
+                    context,
+                )
+
+            self.assertFalse(
+                upload.exists()
+            )
+
+            self.assertNotIn(
+                IMPORT_SESSION_KEY,
+                context.user_data,
+            )
+
+            query.edit_message_text.assert_awaited_once()
+
+    async def test_apply_calls_transactional_writer_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = (
+                Path(temp)
+                / "kokabiel.db"
+            )
+
+            pending = PendingImport(
+                token="deadbeef",
+                user_id=123,
+                user_name="Mike",
+                chat_id=123,
+                state="ready",
+                preview=preview(),
+            )
+
+            context = SimpleNamespace(
+                user_data={
+                    IMPORT_SESSION_KEY: pending
+                }
+            )
+
+            update, query = (
+                self.callback_update(
+                    "imp|apply|deadbeef"
+                )
+            )
+
+            result = SimpleNamespace(
+                already_applied=False,
+                media_added=1,
+                states_added=1,
+                states_updated=0,
+                episodes_added=10,
+                ratings_added=0,
+            )
+
+            writer = MagicMock(
+                return_value=result
+            )
+
+            with (
+                patch(
+                    "handlers.imports.allowed",
+                    new=AsyncMock(
+                        return_value=True
+                    ),
+                ),
+                patch(
+                    "handlers.imports.settings",
+                    return_value=SimpleNamespace(
+                        database_path=database
+                    ),
+                ),
+                patch(
+                    "handlers.imports.apply_database_import",
+                    new=writer,
+                ),
+            ):
+                await import_callback_router(
+                    update,
+                    context,
+                )
+
+            writer.assert_called_once()
+
+            call = writer.call_args
+
+            self.assertIs(
+                call.args[0],
+                pending.preview,
+            )
+
+            self.assertEqual(
+                call.kwargs[
+                    "database_path"
+                ],
+                database,
+            )
+
+            self.assertEqual(
+                call.kwargs[
+                    "user_name"
+                ],
+                "Mike",
+            )
+
+            self.assertEqual(
+                call.kwargs[
+                    "chat_id"
+                ],
+                123,
+            )
+
+            backup = call.kwargs[
+                "backup_path"
+            ]
+
+            self.assertEqual(
+                backup.parent.stat().st_mode
+                & 0o777,
+                0o700,
+            )
+
+            self.assertNotIn(
+                IMPORT_SESSION_KEY,
+                context.user_data,
+            )
+
+            self.assertIn(
+                "Import complete",
+                query.edit_message_text
+                .await_args.args[0],
+            )
+
+    async def test_stale_apply_discards_old_preview(self):
+        from imports.db_apply import (
+            ImportPreviewStaleError,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = (
+                Path(temp)
+                / "kokabiel.db"
+            )
+
+            pending = PendingImport(
+                token="deadbeef",
+                user_id=123,
+                user_name="Mike",
+                chat_id=123,
+                state="ready",
+                preview=preview(),
+            )
+
+            context = SimpleNamespace(
+                user_data={
+                    IMPORT_SESSION_KEY: pending
+                }
+            )
+
+            update, query = (
+                self.callback_update(
+                    "imp|apply|deadbeef"
+                )
+            )
+
+            with (
+                patch(
+                    "handlers.imports.allowed",
+                    new=AsyncMock(
+                        return_value=True
+                    ),
+                ),
+                patch(
+                    "handlers.imports.settings",
+                    return_value=SimpleNamespace(
+                        database_path=database
+                    ),
+                ),
+                patch(
+                    "handlers.imports.apply_database_import",
+                    side_effect=(
+                        ImportPreviewStaleError(
+                            "stale"
+                        )
+                    ),
+                ),
+            ):
+                await import_callback_router(
+                    update,
+                    context,
+                )
+
+            self.assertNotIn(
+                IMPORT_SESSION_KEY,
+                context.user_data,
+            )
+
+            self.assertIn(
+                "changed after this preview",
+                query.edit_message_text
+                .await_args.args[0],
+            )
+
+    async def test_successful_preview_deletes_raw_upload_immediately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = (
+                Path(temp)
+                / "kokabiel.db"
+            )
+
+            pending = PendingImport(
+                token="deadbeef",
+                user_id=123,
+                user_name="Mike",
+                chat_id=123,
+                state="awaiting_upload",
+            )
+
+            fake_file = SimpleNamespace(
+                download_to_drive=AsyncMock()
+            )
+
+            async def download_to_drive(
+                *,
+                custom_path,
+            ):
+                Path(
+                    custom_path
+                ).write_text(
+                    "temporary tracker data"
+                )
+
+            fake_file.download_to_drive.side_effect = (
+                download_to_drive
+            )
+
+            context = SimpleNamespace(
+                user_data={
+                    IMPORT_SESSION_KEY: pending
+                },
+                bot=SimpleNamespace(
+                    get_file=AsyncMock(
+                        return_value=fake_file
+                    )
+                ),
+            )
+
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(
+                    id=123,
+                    type=ChatType.PRIVATE,
+                ),
+                effective_user=SimpleNamespace(
+                    id=123,
+                    full_name="Mike",
+                    username=None,
+                ),
+                effective_message=SimpleNamespace(
+                    document=SimpleNamespace(
+                        file_name="ratings.csv",
+                        file_size=100,
+                        file_id="telegram-file",
+                    )
+                ),
+            )
+
+            expected_preview = preview()
+
+            with (
+                patch(
+                    "handlers.imports.allowed",
+                    new=AsyncMock(
+                        return_value=True
+                    ),
+                ),
+                patch(
+                    "handlers.imports.settings",
+                    return_value=SimpleNamespace(
+                        database_path=database
+                    ),
+                ),
+                patch(
+                    "handlers.imports.tmdb",
+                    return_value=object(),
+                ),
+                patch(
+                    "handlers.imports.analyze_import",
+                    return_value=object(),
+                ),
+                patch(
+                    "handlers.imports.resolve_import_plan",
+                    new=AsyncMock(
+                        return_value=object()
+                    ),
+                ),
+                patch(
+                    "handlers.imports.preview_database_import",
+                    return_value=expected_preview,
+                ),
+                patch(
+                    "handlers.imports.reply_personal_text",
+                    new=AsyncMock(),
+                ),
+            ):
+                await receive_import_document(
+                    update,
+                    context,
+                )
+
+            ready = context.user_data[
+                IMPORT_SESSION_KEY
+            ]
+
+            self.assertEqual(
+                ready.state,
+                "ready",
+            )
+            self.assertIsNone(
+                ready.path
+            )
+            self.assertIs(
+                ready.preview,
+                expected_preview,
+            )
+
+            quarantine = (
+                _quarantine_path(
+                    database,
+                    123,
+                    "deadbeef",
+                    "ratings.csv",
+                )
+            )
+
+            self.assertFalse(
+                quarantine.exists()
+            )
 
 
 if __name__ == "__main__":

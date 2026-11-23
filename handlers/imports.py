@@ -23,6 +23,11 @@ from handlers.common import (
     tmdb,
     user_identity,
 )
+from imports.db_apply import (
+    ImportApplyError,
+    ImportPreviewStaleError,
+    apply_database_import,
+)
 from imports.db_preview import (
     ImportDatabasePreview,
     preview_database_import,
@@ -49,6 +54,7 @@ ImportSessionState = Literal[
     "awaiting_upload",
     "processing",
     "ready",
+    "applying",
 ]
 
 
@@ -307,6 +313,17 @@ async def receive_import_document(
             user_id=pending.user_id,
         )
 
+        # The transactional writer needs only the approved preview.
+        # Do not retain a member's raw tracker export while they decide.
+        _delete_path(
+            upload_path
+        )
+
+        processing = replace(
+            processing,
+            path=None,
+        )
+
     except (
         ImportSecurityError,
         ImportDetectionError,
@@ -414,6 +431,264 @@ async def receive_import_document(
                 pending.token,
             )
         ),
+    )
+
+
+async def import_callback_router(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+
+    if query is None:
+        return
+
+    parts = (
+        query.data or ""
+    ).split("|")
+
+    if (
+        len(parts) != 3
+        or parts[0] != "imp"
+    ):
+        await query.answer(
+            "That import action is no longer valid.",
+            show_alert=True,
+        )
+        return
+
+    if not await allowed(
+        update,
+        context,
+    ):
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if (
+        chat is None
+        or user is None
+        or chat.type != ChatType.PRIVATE
+    ):
+        await query.answer(
+            "Import actions are available only in a private chat.",
+            show_alert=True,
+        )
+        return
+
+    action = parts[1]
+    token = parts[2]
+
+    pending = context.user_data.get(
+        IMPORT_SESSION_KEY
+    )
+
+    if (
+        not isinstance(
+            pending,
+            PendingImport,
+        )
+        or pending.token != token
+        or pending.user_id != user.id
+        or pending.chat_id != chat.id
+    ):
+        await query.answer(
+            "That import preview expired or belongs to another session.",
+            show_alert=True,
+        )
+        return
+
+    if action == "cancel":
+        _discard_pending_import(
+            context
+        )
+
+        await query.answer(
+            "Import cancelled."
+        )
+
+        await query.edit_message_text(
+            "Import cancelled. No changes were requested."
+        )
+        return
+
+    if (
+        pending.state != "ready"
+        or pending.preview is None
+    ):
+        await query.answer(
+            "That import preview is no longer ready.",
+            show_alert=True,
+        )
+        return
+
+    preview = pending.preview
+
+    if action == "review":
+        if not preview.review_count:
+            await query.answer(
+                "This preview has no review-blocking items.",
+                show_alert=True,
+            )
+            return
+
+        await query.answer(
+            (
+                f"{preview.review_count} item(s) still require review. "
+                "Kokabiel will not apply this import automatically."
+            ),
+            show_alert=True,
+        )
+        return
+
+    if action != "apply":
+        await query.answer(
+            "That import action is not valid.",
+            show_alert=True,
+        )
+        return
+
+    if preview.review_count:
+        await query.answer(
+            "This import still contains review-required items.",
+            show_alert=True,
+        )
+        return
+
+    if not any(
+        item.has_changes
+        for item in preview.items
+    ):
+        await query.answer(
+            "There is nothing new to import.",
+            show_alert=True,
+        )
+        return
+
+    current_settings = settings(
+        context
+    )
+
+    backup_path = _backup_path(
+        current_settings.database_path,
+        pending.user_id,
+        pending.token,
+    )
+
+    _prepare_backup_directory(
+        backup_path.parent
+    )
+
+    applying = replace(
+        pending,
+        state="applying",
+    )
+
+    context.user_data[
+        IMPORT_SESSION_KEY
+    ] = applying
+
+    await query.answer(
+        "Applying approved import…"
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            apply_database_import,
+            preview,
+            database_path=(
+                current_settings.database_path
+            ),
+            backup_path=backup_path,
+            user_name=pending.user_name,
+            chat_id=pending.chat_id,
+        )
+
+    except ImportPreviewStaleError:
+        _discard_pending_import(
+            context
+        )
+
+        await query.edit_message_text(
+            (
+                "The database changed after this preview was created. "
+                "Nothing further was attempted from this preview. "
+                "Run /import again to build a fresh one."
+            )
+        )
+        return
+
+    except ImportApplyError:
+        LOGGER.exception(
+            "Transactional import failed for user %s",
+            pending.user_id,
+        )
+
+        _discard_pending_import(
+            context
+        )
+
+        await query.edit_message_text(
+            (
+                "Kokabiel could not complete this import safely. "
+                "Run /import again before retrying."
+            )
+        )
+        return
+
+    except Exception:
+        LOGGER.exception(
+            "Unexpected import apply failure for user %s",
+            pending.user_id,
+        )
+
+        _discard_pending_import(
+            context
+        )
+
+        await query.edit_message_text(
+            (
+                "Kokabiel could not verify that this import completed "
+                "normally. Run /import again before retrying."
+            )
+        )
+        return
+
+    _discard_pending_import(
+        context
+    )
+
+    await query.edit_message_text(
+        format_import_result(
+            result
+        ),
+        parse_mode="HTML",
+    )
+
+
+def format_import_result(
+    result,
+) -> str:
+    if result.already_applied:
+        return (
+            "✅ <b>Import already applied</b>\n\n"
+            "This approved preview had already been written. "
+            "No duplicate changes were added."
+        )
+
+    return "\n".join(
+        [
+            "✅ <b>Import complete</b>",
+            "",
+            f"• Catalog rows added: {result.media_added}",
+            f"• Personal states added: {result.states_added}",
+            f"• Personal states updated: {result.states_updated}",
+            f"• Episodes added: {result.episodes_added}",
+            f"• Ratings added: {result.ratings_added}",
+            "",
+            "A verified pre-import database backup was created.",
+        ]
     )
 
 
@@ -626,6 +901,44 @@ def _quarantine_path(
         / "quarantine"
         / str(user_id)
         / f"{token}{suffix}"
+    )
+
+
+def _backup_path(
+    database_path: Path,
+    user_id: int,
+    token: str,
+) -> Path:
+    return (
+        database_path.resolve().parent
+        / "imports"
+        / "backups"
+        / str(user_id)
+        / f"preimport-{token}.db"
+    )
+
+
+def _prepare_backup_directory(
+    directory: Path,
+) -> None:
+    backup_root = (
+        directory.parent
+    )
+
+    backup_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    backup_root.chmod(
+        0o700
+    )
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    directory.chmod(
+        0o700
     )
 
 
