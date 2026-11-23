@@ -12,6 +12,8 @@ from tmdb import TmdbClient
 
 LOGGER = logging.getLogger(__name__)
 
+PRIVATE_LABEL = "🔒 Private to you\n\n"
+
 
 def settings(context: ContextTypes.DEFAULT_TYPE) -> Settings:
     return context.application.bot_data["settings"]
@@ -59,7 +61,7 @@ async def reply_personal_text(
 
     kwargs = {
         "chat_id": chat.id,
-        "text": text,
+        "text": PRIVATE_LABEL + text,
         "parse_mode": parse_mode,
         "api_kwargs": {
             "ephemeral_message_parameters": {
@@ -100,7 +102,7 @@ async def send_personal_callback_text(
 
     return await context.bot.send_message(
         chat_id=chat.id,
-        text=text,
+        text=PRIVATE_LABEL + text,
         parse_mode=parse_mode,
         reply_markup=reply_markup,
         api_kwargs={
@@ -122,10 +124,16 @@ async def edit_personal_text(
 ) -> None:
     """Edit either a normal private reply or an ephemeral group reply."""
 
+    display_text = (
+        PRIVATE_LABEL + text
+        if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
+        else text
+    )
+
     ephemeral_id = _ephemeral_message_id(message)
     if ephemeral_id is None:
         await message.edit_text(
-            text=text,
+            text=display_text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
         )
@@ -135,7 +143,7 @@ async def edit_personal_text(
         "chat_id": message.chat.id,
         "receiver_user_id": receiver_user_id,
         "ephemeral_message_id": ephemeral_id,
-        "text": text,
+        "text": display_text,
         "reply_markup": (
             reply_markup.to_dict()
             if reply_markup is not None
