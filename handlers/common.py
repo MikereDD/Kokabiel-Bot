@@ -40,6 +40,7 @@ async def reply_personal_text(
     text: str,
     *,
     parse_mode=None,
+    reply_markup=None,
 ):
     """Send personal output without exposing it to the group."""
 
@@ -52,7 +53,11 @@ async def reply_personal_text(
 
     # Owner-private access remains a normal private-chat response.
     if chat.type == ChatType.PRIVATE:
-        return await message.reply_text(text, parse_mode=parse_mode)
+        return await message.reply_text(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
 
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return None
@@ -63,6 +68,7 @@ async def reply_personal_text(
         "chat_id": chat.id,
         "text": PRIVATE_LABEL + text,
         "parse_mode": parse_mode,
+        "reply_markup": reply_markup,
         "api_kwargs": {
             "ephemeral_message_parameters": {
                 "receiver_user_id": user.id,
