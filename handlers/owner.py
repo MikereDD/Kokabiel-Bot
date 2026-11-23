@@ -21,6 +21,7 @@ from handlers.common import database, settings
 from keyboards import owner_confirmation_keyboard
 from logging_setup import configure_logging
 from tmdb import TmdbClient
+from version import __version__
 
 LOGGER = logging.getLogger(__name__)
 CONFIRMATION_TTL_SECONDS = 10 * 60
@@ -143,6 +144,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.effective_message.reply_text(
         "<b>Kokabiel status</b>\n\n"
+        f"Version: <code>v{_escape(__version__)}</code>\n"
         f"Bot: @{_escape(me.username or me.first_name)}\n"
         f"Uptime: {_escape(uptime)}\n"
         f"Process ID: <code>{os.getpid()}</code>\n"

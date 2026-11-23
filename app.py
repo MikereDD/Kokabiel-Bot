@@ -40,6 +40,7 @@ from handlers.owner import (
 )
 from logging_setup import configure_logging
 from tmdb import TmdbClient
+from version import __version__
 
 LOGGER = logging.getLogger(__name__)
 
@@ -92,7 +93,8 @@ async def post_init(application: Application) -> None:
     await application.bot_data["database"].initialize()
     await application.bot.set_my_commands(COMMANDS)
     LOGGER.info(
-        "Kokabiel initialized with %s configured owner(s)",
+        "Kokabiel v%s initialized with %s configured owner(s)",
+        __version__,
         len(settings.owner_user_ids),
     )
 

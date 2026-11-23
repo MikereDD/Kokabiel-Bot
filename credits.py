@@ -1,5 +1,7 @@
 """Project credits and third-party attribution text."""
 
+from version import __version__
+
 TMDB_URL = "https://www.themoviedb.org/"
 TMDB_ATTRIBUTION_URL = "https://www.themoviedb.org/about/logos-attribution"
 TMDB_ATTRIBUTION_NOTICE = (
@@ -9,6 +11,7 @@ TMDB_ATTRIBUTION_NOTICE = (
 BOT_TAGLINE = "Film, TV & Documentary Guide"
 
 ABOUT_CAPTION = f"""<b>Kokabiel — {BOT_TAGLINE}</b>
+<code>v{__version__}</code>
 
 Command-driven discovery for films, TV series, and documentaries,
 with personal progress, group watchlists, ratings, and suggestions.

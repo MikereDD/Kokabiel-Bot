@@ -4,6 +4,7 @@
 
 # Kokabiel
 
+[![Version](https://img.shields.io/badge/version-0.2.0--dev-gold)](https://github.com/MikereDD/Kokabiel-Bot/releases)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Telegram-26A5E4)
 ![Library](https://img.shields.io/badge/python--telegram--bot-21.x-blue)
@@ -14,6 +15,8 @@
 ### Film, TV & Documentary Guide for Telegram
 
 **Command-driven discovery · Personal progress · Group watchlists · TMDB-powered metadata**
+
+**Current development version: `v0.2.0-dev`**
 
 </div>
 
