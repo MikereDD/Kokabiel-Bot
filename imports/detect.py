@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import zipfile
 
 from dataclasses import dataclass
@@ -56,6 +57,8 @@ LETTERBOXD_BASENAMES = frozenset(
 
 def detect_import_source(
     path: str | Path,
+    *,
+    source_name: str | None = None,
 ) -> DetectedImport:
     """
     Validate an upload through the security gate and identify its source.
@@ -74,7 +77,11 @@ def detect_import_source(
         return _detect_csv(candidate, inspection)
 
     if inspection.kind == "json":
-        return _detect_json(candidate, inspection)
+        return _detect_json(
+            candidate,
+            inspection,
+            source_name=source_name,
+        )
 
     raise ImportDetectionError(
         f"Validated import type is not source-detectable: {inspection.kind}"
@@ -225,21 +232,84 @@ def _detect_csv(
 def _detect_json(
     path: Path,
     inspection: InspectionResult,
+    *,
+    source_name: str | None = None,
 ) -> DetectedImport:
-    name = path.name.casefold()
+    name = _source_basename(
+        source_name or path.name
+    )
+    folded = name.casefold()
 
-    if any(
-        name.startswith(prefix)
-        for prefix in TRAKT_PREFIXES
+    if (
+        any(
+            folded.startswith(prefix)
+            for prefix in TRAKT_PREFIXES
+        )
+        and _looks_like_trakt_json(path)
     ):
         return DetectedImport(
             source="trakt",
             inspection=inspection,
-            evidence=(path.name,),
+            evidence=(name,),
         )
 
     raise ImportDetectionError(
         "Validated JSON does not match a supported tracker export."
+    )
+
+
+def _source_basename(
+    value: str,
+) -> str:
+    name = PurePosixPath(
+        value.replace("\\", "/")
+    ).name
+
+    return name or value
+
+
+def _looks_like_trakt_json(
+    path: Path,
+) -> bool:
+    try:
+        payload = json.loads(
+            path.read_bytes().decode("utf-8-sig")
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+    if isinstance(payload, list):
+        items = payload
+
+    elif isinstance(payload, dict):
+        nested = payload.get("items")
+
+        if isinstance(nested, list):
+            items = nested
+        else:
+            items = [payload]
+
+    else:
+        return False
+
+    # An empty native export is valid and harmless.
+    if not items:
+        return True
+
+    entity_keys = {
+        "movie",
+        "show",
+        "season",
+        "episode",
+    }
+
+    return all(
+        isinstance(item, dict)
+        and bool(entity_keys & set(item))
+        for item in items
     )
 
 

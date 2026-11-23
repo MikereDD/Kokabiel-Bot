@@ -759,6 +759,9 @@ class ImportTelegramApprovalTests(
             )
 
             expected_preview = preview()
+            analyzer = MagicMock(
+                return_value=object()
+            )
 
             with (
                 patch(
@@ -779,7 +782,7 @@ class ImportTelegramApprovalTests(
                 ),
                 patch(
                     "handlers.imports.analyze_import",
-                    return_value=object(),
+                    new=analyzer,
                 ),
                 patch(
                     "handlers.imports.resolve_import_plan",
@@ -800,6 +803,15 @@ class ImportTelegramApprovalTests(
                     update,
                     context,
                 )
+
+            analyzer.assert_called_once()
+
+            self.assertEqual(
+                analyzer.call_args.kwargs[
+                    "source_name"
+                ],
+                "ratings.csv",
+            )
 
             ready = context.user_data[
                 IMPORT_SESSION_KEY

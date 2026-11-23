@@ -123,7 +123,10 @@ class ImportDetectionTests(unittest.TestCase):
     def test_detects_trakt_json_member(self) -> None:
         path = self.write(
             "watched-history-1.json",
-            '[{"id":1}]',
+            (
+                '[{"movie":{"title":"Alien","year":1979,'
+                '"ids":{"tmdb":348}}}]'
+            ),
         )
 
         result = detect_import_source(path)

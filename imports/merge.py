@@ -53,9 +53,14 @@ class ImportPlan:
 
 def analyze_import(
     path: str,
+    *,
+    source_name: str | None = None,
 ) -> ImportPlan:
     return build_import_plan(
-        parse_import(path)
+        parse_import(
+            path,
+            source_name=source_name,
+        )
     )
 
 

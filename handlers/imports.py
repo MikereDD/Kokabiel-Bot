@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from secrets import token_hex
 from typing import Literal
 
@@ -217,7 +217,7 @@ async def receive_import_document(
     document = message.document
 
     try:
-        suffix = _safe_upload_suffix(
+        source_name = _safe_upload_name(
             document.file_name
         )
     except ValueError as exc:
@@ -295,6 +295,7 @@ async def receive_import_document(
         plan = await asyncio.to_thread(
             analyze_import,
             str(upload_path),
+            source_name=source_name,
         )
 
         resolution = (
@@ -861,7 +862,7 @@ def import_preview_keyboard(
     )
 
 
-def _safe_upload_suffix(
+def _safe_upload_name(
     file_name: str | None,
 ) -> str:
     if not file_name:
@@ -870,8 +871,18 @@ def _safe_upload_suffix(
             "or ZIP filename."
         )
 
+    name = PurePosixPath(
+        file_name.replace("\\", "/")
+    ).name
+
+    if not name:
+        raise ValueError(
+            "The uploaded document must have a CSV, JSON, "
+            "or ZIP filename."
+        )
+
     suffix = Path(
-        file_name
+        name
     ).suffix.casefold()
 
     if (
@@ -882,7 +893,15 @@ def _safe_upload_suffix(
             "Only CSV, JSON, and ZIP tracker exports are accepted."
         )
 
-    return suffix
+    return name
+
+
+def _safe_upload_suffix(
+    file_name: str | None,
+) -> str:
+    return Path(
+        _safe_upload_name(file_name)
+    ).suffix.casefold()
 
 
 def _quarantine_path(

@@ -74,6 +74,8 @@ LAST_EPISODE_PATTERN = re.compile(
 
 def parse_import(
     path: str | Path,
+    *,
+    source_name: str | None = None,
 ) -> ParsedImport:
     """
     Validate, detect and normalize a tracker export.
@@ -83,7 +85,21 @@ def parse_import(
     """
 
     candidate = Path(path)
-    detected = detect_import_source(candidate)
+
+    logical_name = PurePosixPath(
+        (
+            source_name
+            or candidate.name
+        ).replace("\\", "/")
+    ).name
+
+    if not logical_name:
+        logical_name = candidate.name
+
+    detected = detect_import_source(
+        candidate,
+        source_name=logical_name,
+    )
 
     _assert_unchanged(
         candidate,
@@ -97,17 +113,17 @@ def parse_import(
         data = candidate.read_bytes()
         records = _parse_imdb_csv(
             data,
-            candidate.name,
+            logical_name,
         )
-        source_files = [candidate.name]
+        source_files = [logical_name]
 
     elif detected.source == "simkl":
         data = candidate.read_bytes()
         records = _parse_simkl_csv(
             data,
-            candidate.name,
+            logical_name,
         )
-        source_files = [candidate.name]
+        source_files = [logical_name]
 
     elif detected.source == "letterboxd":
         if detected.inspection.kind == "zip":
@@ -118,9 +134,9 @@ def parse_import(
             data = candidate.read_bytes()
             records = _parse_letterboxd_csv(
                 data,
-                candidate.name,
+                logical_name,
             )
-            source_files = [candidate.name]
+            source_files = [logical_name]
 
     elif detected.source == "trakt":
         if detected.inspection.kind == "zip":
@@ -131,9 +147,9 @@ def parse_import(
             data = candidate.read_bytes()
             records = _parse_trakt_json(
                 data,
-                candidate.name,
+                logical_name,
             )
-            source_files = [candidate.name]
+            source_files = [logical_name]
 
     else:
         raise ImportParseError(
