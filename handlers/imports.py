@@ -13,6 +13,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
+from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
 from handlers.common import (
@@ -76,6 +77,34 @@ async def import_command(
     user = update.effective_user
 
     if chat is None or user is None:
+        return
+
+    if chat.type in {
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    }:
+        _discard_pending_import(
+            context
+        )
+
+        await reply_personal_text(
+            update,
+            context,
+            (
+                "📥 <b>Import tracker data</b>\n\n"
+                "Tracker export uploads are not accepted in "
+                "group chats yet. Telegram can keep the "
+                "/import command private, but an ordinary "
+                "document uploaded by you to the group is not "
+                "a private bot upload.\n\n"
+                "Kokabiel will not ask you to expose your "
+                "watch history or ratings to the group."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    if chat.type != ChatType.PRIVATE:
         return
 
     _discard_pending_import(
@@ -147,6 +176,12 @@ async def receive_import_document(
         or message is None
         or message.document is None
     ):
+        return
+
+    # Never ingest a member's ordinary group document as personal
+    # tracker data. Group uploads are visible outside the private
+    # ephemeral interaction used by Kokabiel.
+    if chat.type != ChatType.PRIVATE:
         return
 
     if (

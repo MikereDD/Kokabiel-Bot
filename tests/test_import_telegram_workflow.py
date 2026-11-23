@@ -5,12 +5,18 @@ import unittest
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from telegram.constants import ChatType
 
 from handlers.imports import (
+    IMPORT_SESSION_KEY,
+    PendingImport,
     _prepare_quarantine_directory,
     _quarantine_path,
     _safe_upload_suffix,
     format_import_preview,
+    import_command,
     import_preview_keyboard,
 )
 
@@ -197,6 +203,113 @@ class ImportTelegramWorkflowTests(
                 "imp|review|deadbeef",
                 "imp|cancel|deadbeef",
             ],
+        )
+
+
+class ImportTelegramWorkflowAsyncTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    async def test_group_import_does_not_arm_document_upload(self):
+        context = SimpleNamespace(
+            user_data={}
+        )
+
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(
+                id=-100123,
+                type=ChatType.SUPERGROUP,
+            ),
+            effective_user=SimpleNamespace(
+                id=123,
+                full_name="Mike",
+                username=None,
+            ),
+        )
+
+        reply = AsyncMock()
+
+        with (
+            patch(
+                "handlers.imports.allowed",
+                new=AsyncMock(
+                    return_value=True
+                ),
+            ),
+            patch(
+                "handlers.imports.reply_personal_text",
+                new=reply,
+            ),
+        ):
+            await import_command(
+                update,
+                context,
+            )
+
+        self.assertNotIn(
+            IMPORT_SESSION_KEY,
+            context.user_data,
+        )
+
+        reply.assert_awaited_once()
+
+        self.assertIn(
+            "not accepted in group chats",
+            reply.await_args.args[2],
+        )
+
+    async def test_private_import_arms_upload_session(self):
+        context = SimpleNamespace(
+            user_data={}
+        )
+
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(
+                id=123,
+                type=ChatType.PRIVATE,
+            ),
+            effective_user=SimpleNamespace(
+                id=123,
+                full_name="Mike",
+                username=None,
+            ),
+        )
+
+        with (
+            patch(
+                "handlers.imports.allowed",
+                new=AsyncMock(
+                    return_value=True
+                ),
+            ),
+            patch(
+                "handlers.imports.reply_personal_text",
+                new=AsyncMock(),
+            ),
+        ):
+            await import_command(
+                update,
+                context,
+            )
+
+        pending = context.user_data.get(
+            IMPORT_SESSION_KEY
+        )
+
+        self.assertIsInstance(
+            pending,
+            PendingImport,
+        )
+        self.assertEqual(
+            pending.state,
+            "awaiting_upload",
+        )
+        self.assertEqual(
+            pending.user_id,
+            123,
+        )
+        self.assertEqual(
+            pending.chat_id,
+            123,
         )
 
 
