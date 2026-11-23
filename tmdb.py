@@ -87,6 +87,57 @@ class TmdbClient:
         )
         return self._parse_results(payload.get("results", []), "tv")[:limit]
 
+    async def lookup_result(
+        self,
+        media_type: MediaType,
+        tmdb_id: int,
+    ) -> SearchResult:
+        """Fetch and verify one canonical TMDB movie/TV identity."""
+
+        payload = await self._get(
+            f"/{media_type}/{tmdb_id}"
+        )
+        parsed = self._parse_results(
+            [payload],
+            media_type,
+        )
+
+        if not parsed:
+            raise TmdbError(
+                f"TMDB returned no usable {media_type} identity for {tmdb_id}."
+            )
+
+        return parsed[0]
+
+    async def find_by_imdb(
+        self,
+        imdb_id: str,
+        limit: int = 8,
+    ) -> list[SearchResult]:
+        """Resolve an IMDb external ID to TMDB movie/TV identities."""
+
+        payload = await self._get(
+            f"/find/{imdb_id}",
+            external_source="imdb_id",
+        )
+
+        parsed: list[SearchResult] = []
+
+        parsed.extend(
+            self._parse_results(
+                payload.get("movie_results", []),
+                "movie",
+            )
+        )
+        parsed.extend(
+            self._parse_results(
+                payload.get("tv_results", []),
+                "tv",
+            )
+        )
+
+        return parsed[:limit]
+
     async def search_multi(self, query: str, limit: int = 8) -> list[SearchResult]:
         payload = await self._get(
             "/search/multi",
