@@ -81,6 +81,36 @@ async def reply_personal_text(
     return await context.bot.send_message(**kwargs)
 
 
+async def send_personal_callback_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode=None,
+    reply_markup=None,
+):
+    """Send a private in-group response to the user who pressed a button."""
+
+    query = update.callback_query
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if query is None or chat is None or user is None:
+        return None
+
+    return await context.bot.send_message(
+        chat_id=chat.id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        api_kwargs={
+            "ephemeral_message_parameters": {
+                "receiver_user_id": user.id,
+            },
+        },
+    )
+
+
 async def edit_personal_text(
     context: ContextTypes.DEFAULT_TYPE,
     message,
@@ -88,12 +118,17 @@ async def edit_personal_text(
     text: str,
     *,
     parse_mode=None,
+    reply_markup=None,
 ) -> None:
     """Edit either a normal private reply or an ephemeral group reply."""
 
     ephemeral_id = _ephemeral_message_id(message)
     if ephemeral_id is None:
-        await message.edit_text(text=text, parse_mode=parse_mode)
+        await message.edit_text(
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
         return
 
     data = {
@@ -101,6 +136,11 @@ async def edit_personal_text(
         "receiver_user_id": receiver_user_id,
         "ephemeral_message_id": ephemeral_id,
         "text": text,
+        "reply_markup": (
+            reply_markup.to_dict()
+            if reply_markup is not None
+            else {"inline_keyboard": []}
+        ),
     }
     if parse_mode is not None:
         data["parse_mode"] = parse_mode
@@ -108,6 +148,28 @@ async def edit_personal_text(
     await context.bot._post(
         "editEphemeralMessageText",
         data=data,
+    )
+
+
+async def delete_personal_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    receiver_user_id: int,
+) -> None:
+    """Delete either a normal private message or an ephemeral group message."""
+
+    ephemeral_id = _ephemeral_message_id(message)
+    if ephemeral_id is None:
+        await message.delete()
+        return
+
+    await context.bot._post(
+        "deleteEphemeralMessage",
+        data={
+            "chat_id": message.chat.id,
+            "receiver_user_id": receiver_user_id,
+            "ephemeral_message_id": ephemeral_id,
+        },
     )
 
 

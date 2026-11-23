@@ -13,7 +13,10 @@ from formatting import media_caption, progress_summary_text
 from handlers.common import (
     allowed,
     database,
+    delete_personal_message,
+    edit_personal_text,
     media_type_from_short,
+    send_personal_callback_text,
     tmdb,
     user_identity,
 )
@@ -54,7 +57,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("That episode has not aired yet.", show_alert=True)
             return
         if len(parts) == 3 and parts[:2] == ["menu", "close"]:
-            await _close_personal_menu(update, int(parts[2]))
+            await _close_personal_menu(update, context, int(parts[2]))
             return
         if len(parts) == 3 and parts[0] == "pick":
             await _pick(update, context, parts[1], int(parts[2]))
@@ -197,16 +200,16 @@ async def _action(
 
     if action == "rate":
         await query.answer("Choose your personal rating.")
-        await context.bot.send_message(
-            chat_id,
-            text=(
+        await send_personal_callback_text(
+            update,
+            context,
+            (
                 f"⭐ <b>{escape(user_name)}’s rating</b>\n"
                 f"<b>{escape(details.title)}</b> ({escape(details.year)})\n\n"
                 "Choose a score from 1 to 10."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=rating_keyboard(details, user_id),
-            reply_to_message_id=query.message.message_id if query.message else None,
         )
         return
 
@@ -216,9 +219,10 @@ async def _action(
             return
         await query.answer("Opening your progress menu.")
         state, released_keys = await _series_state(update, context, details)
-        await context.bot.send_message(
-            chat_id,
-            text=progress_summary_text(
+        await send_personal_callback_text(
+            update,
+            context,
+            progress_summary_text(
                 details,
                 user_name=user_name,
                 status=state.viewing_status,
@@ -227,7 +231,6 @@ async def _action(
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=progress_menu_keyboard(details, user_id),
-            reply_to_message_id=query.message.message_id if query.message else None,
         )
         return
 
@@ -258,8 +261,11 @@ async def _score(
         update.effective_chat.id, media_type, tmdb_id
     )
     await query.answer(f"Your rating: {rating}/10")
-    await query.edit_message_text(
-        text=(
+    await edit_personal_text(
+        context,
+        query.message,
+        owner_id,
+        (
             f"⭐ <b>{escape(details.title)}</b>\n\n"
             f"Your rating: <b>{rating}/10</b>\n"
             f"Group rating: <b>{average:.1f}/10</b> ({count} "
@@ -350,7 +356,9 @@ async def _progress_open(
     _, user_name = user_identity(update)
     await query.answer()
     await _edit_personal_menu(
+        context,
         query,
+        owner_id,
         progress_summary_text(
             details,
             user_name=user_name,
@@ -381,7 +389,9 @@ async def _progress_seasons(
     )
     await query.answer()
     await _edit_personal_menu(
+        context,
         query,
+        owner_id,
         f"📚 <b>{escape(details.title)} — choose a season</b>\n\n"
         "Each episode selection is personal to you.",
         season_list_keyboard(details, owner_id, page, counts),
@@ -413,7 +423,9 @@ async def _progress_season(
     released_in_season = len(released)
     await query.answer()
     await _edit_personal_menu(
+        context,
         query,
+        owner_id,
         (
             f"📺 <b>{escape(details.title)} — {escape(season.name)}</b>\n\n"
             f"Watched: {watched_in_season}/{released_in_season} released episodes\n"
@@ -618,7 +630,9 @@ async def _progress_season_no_answer(
     released = _released_keys_for_season(season)
     watched_in_season = len([key for key in watched if key[0] == season.season_number])
     await _edit_personal_menu(
+        context,
         query,
+        owner_id,
         (
             f"📺 <b>{escape(details.title)} — {escape(season.name)}</b>\n\n"
             f"Watched: {watched_in_season}/{len(released)} released episodes\n"
@@ -640,7 +654,9 @@ async def _progress_open_no_answer(
     state, released_keys = await _series_state(update, context, details)
     _, user_name = user_identity(update)
     await _edit_personal_menu(
+        context,
         query,
+        owner_id,
         progress_summary_text(
             details,
             user_name=user_name,
@@ -713,21 +729,35 @@ async def _personal_menu_owner(update: Update, owner_id: int) -> bool:
     return False
 
 
-async def _close_personal_menu(update: Update, owner_id: int) -> None:
+async def _close_personal_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    owner_id: int,
+) -> None:
     if not await _personal_menu_owner(update, owner_id):
         return
     query = update.callback_query
     await query.answer()
-    try:
-        await query.message.delete()
-    except BadRequest:
-        await query.edit_message_reply_markup(reply_markup=None)
+    await delete_personal_message(
+        context,
+        query.message,
+        owner_id,
+    )
 
 
-async def _edit_personal_menu(query, text: str, reply_markup) -> None:
+async def _edit_personal_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    owner_id: int,
+    text: str,
+    reply_markup,
+) -> None:
     try:
-        await query.edit_message_text(
-            text=text,
+        await edit_personal_text(
+            context,
+            query.message,
+            owner_id,
+            text,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup,
         )
