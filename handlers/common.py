@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Update
+from telegram import ReplyParameters, Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
@@ -23,6 +23,90 @@ def database(context: ContextTypes.DEFAULT_TYPE) -> Database:
 
 def tmdb(context: ContextTypes.DEFAULT_TYPE) -> TmdbClient:
     return context.application.bot_data["tmdb"]
+
+
+def _ephemeral_message_id(message) -> int | None:
+    if message is None:
+        return None
+    value = (message.api_kwargs or {}).get("ephemeral_message_id")
+    return value if isinstance(value, int) else None
+
+
+async def reply_personal_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode=None,
+):
+    """Send personal output without exposing it to the group."""
+
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+
+    if chat is None or user is None or message is None:
+        return None
+
+    # Owner-private access remains a normal private-chat response.
+    if chat.type == ChatType.PRIVATE:
+        return await message.reply_text(text, parse_mode=parse_mode)
+
+    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return None
+
+    incoming_ephemeral_id = _ephemeral_message_id(message)
+    if incoming_ephemeral_id is None:
+        # Fail closed and stay silent. Personal data must never be exposed
+        # because the command arrived as an ordinary public group message.
+        return None
+
+    return await context.bot.send_message(
+        chat_id=chat.id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_parameters=ReplyParameters(
+            message_id=None,
+            api_kwargs={
+                "ephemeral_message_id": incoming_ephemeral_id,
+            },
+        ),
+        api_kwargs={
+            "ephemeral_message_parameters": {
+                "receiver_user_id": user.id,
+            },
+        },
+    )
+
+
+async def edit_personal_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    receiver_user_id: int,
+    text: str,
+    *,
+    parse_mode=None,
+) -> None:
+    """Edit either a normal private reply or an ephemeral group reply."""
+
+    ephemeral_id = _ephemeral_message_id(message)
+    if ephemeral_id is None:
+        await message.edit_text(text=text, parse_mode=parse_mode)
+        return
+
+    data = {
+        "chat_id": message.chat.id,
+        "receiver_user_id": receiver_user_id,
+        "ephemeral_message_id": ephemeral_id,
+        "text": text,
+    }
+    if parse_mode is not None:
+        data["parse_mode"] = parse_mode
+
+    await context.bot._post(
+        "editEphemeralMessageText",
+        data=data,
+    )
 
 
 async def allowed(

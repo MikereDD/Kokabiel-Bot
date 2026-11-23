@@ -20,7 +20,15 @@ from formatting import (
     random_pick_text,
     suggestions_text,
 )
-from handlers.common import allowed, database, settings, tmdb, user_identity
+from handlers.common import (
+    allowed,
+    database,
+    edit_personal_text,
+    reply_personal_text,
+    settings,
+    tmdb,
+    user_identity,
+)
 from keyboards import about_keyboard, media_actions_keyboard, search_results_keyboard
 from models import PersonalEntry, SearchResult
 from tmdb import TmdbError
@@ -151,7 +159,9 @@ async def mywatchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     entries = await database(context).list_personal_watchlist(
         update.effective_chat.id, user_id
     )
-    await update.effective_message.reply_text(
+    await reply_personal_text(
+        update,
+        context,
         personal_list_text(f"{user_name}’s watchlist", entries),
         parse_mode=ParseMode.HTML,
     )
@@ -164,7 +174,9 @@ async def watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     entries = await database(context).list_personal_watched(
         update.effective_chat.id, user_id
     )
-    await update.effective_message.reply_text(
+    await reply_personal_text(
+        update,
+        context,
         personal_list_text(f"{user_name}’s watched titles", entries),
         parse_mode=ParseMode.HTML,
     )
@@ -175,6 +187,15 @@ async def myprogress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     user_id, user_name = user_identity(update)
+    loading_message = await reply_personal_text(
+        update,
+        context,
+        "🎞 Loading your media progress…",
+        parse_mode=ParseMode.HTML,
+    )
+    if loading_message is None:
+        return
+
     entries = await database(context).list_personal_progress(
         update.effective_chat.id, user_id
     )
@@ -184,7 +205,10 @@ async def myprogress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         entries[:30],
     )
 
-    await update.effective_message.reply_text(
+    await edit_personal_text(
+        context,
+        loading_message,
+        user_id,
         personal_progress_text(
             user_name,
             entries,
@@ -260,7 +284,9 @@ async def mysuggestions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     entries = await database(context).list_my_suggestions(
         update.effective_chat.id, user_id
     )
-    await update.effective_message.reply_text(
+    await reply_personal_text(
+        update,
+        context,
         suggestions_text(f"{user_name}’s suggestions", entries, personal=True),
         parse_mode=ParseMode.HTML,
     )
