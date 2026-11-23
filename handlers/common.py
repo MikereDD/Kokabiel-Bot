@@ -56,27 +56,29 @@ async def reply_personal_text(
         return None
 
     incoming_ephemeral_id = _ephemeral_message_id(message)
-    if incoming_ephemeral_id is None:
-        # Fail closed and stay silent. Personal data must never be exposed
-        # because the command arrived as an ordinary public group message.
-        return None
 
-    return await context.bot.send_message(
-        chat_id=chat.id,
-        text=text,
-        parse_mode=parse_mode,
-        reply_parameters=ReplyParameters(
-            message_id=None,
-            api_kwargs={
-                "ephemeral_message_id": incoming_ephemeral_id,
-            },
-        ),
-        api_kwargs={
+    kwargs = {
+        "chat_id": chat.id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "api_kwargs": {
             "ephemeral_message_parameters": {
                 "receiver_user_id": user.id,
             },
         },
-    )
+    }
+
+    # Non-admin ephemeral interactions can be tied to the incoming
+    # ephemeral command. Administrators may send directly to the user.
+    if incoming_ephemeral_id is not None:
+        kwargs["reply_parameters"] = ReplyParameters(
+            message_id=None,
+            api_kwargs={
+                "ephemeral_message_id": incoming_ephemeral_id,
+            },
+        )
+
+    return await context.bot.send_message(**kwargs)
 
 
 async def edit_personal_text(
