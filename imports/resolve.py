@@ -128,11 +128,17 @@ async def resolve_import_plan(
 
     resolved_items = []
 
+    lookup_cache: dict[
+        tuple[MediaType, int],
+        SearchResult,
+    ] = {}
+
     for item in plan.items:
         resolved_items.append(
             await _resolve_item(
                 item,
                 tmdb,
+                lookup_cache=lookup_cache,
             )
         )
 
@@ -146,6 +152,11 @@ async def resolve_import_plan(
 async def _resolve_item(
     item: ImportPlanItem,
     tmdb: ResolutionTmdb,
+    *,
+    lookup_cache: dict[
+        tuple[MediaType, int],
+        SearchResult,
+    ],
 ) -> ResolvedImportItem:
     record = item.proposed
 
@@ -184,10 +195,24 @@ async def _resolve_item(
                 ),
             )
 
-        result = await tmdb.lookup_result(
+        lookup_key = (
             expected_type,
             record.tmdb_id,
         )
+
+        result = lookup_cache.get(
+            lookup_key
+        )
+
+        if result is None:
+            result = await tmdb.lookup_result(
+                expected_type,
+                record.tmdb_id,
+            )
+
+            lookup_cache[
+                lookup_key
+            ] = result
 
         if not _claimed_identity_consistent(
             item,

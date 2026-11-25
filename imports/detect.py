@@ -240,6 +240,13 @@ def _detect_json(
     )
     folded = name.casefold()
 
+    if _looks_like_simkl_json(path):
+        return DetectedImport(
+            source="simkl",
+            inspection=inspection,
+            evidence=(name,),
+        )
+
     if (
         any(
             folded.startswith(prefix)
@@ -266,6 +273,54 @@ def _source_basename(
     ).name
 
     return name or value
+
+
+def _looks_like_simkl_json(
+    path: Path,
+) -> bool:
+    try:
+        payload = json.loads(
+            path.read_bytes().decode("utf-8-sig")
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+
+    collections = {
+        "shows": "show",
+        "anime": "show",
+        "movies": "movie",
+    }
+
+    # Native Simkl watchlists backups expose all three collections,
+    # including empty arrays when the account has no records of one type.
+    if not set(collections).issubset(
+        payload
+    ):
+        return False
+
+    for collection, identity_key in collections.items():
+        items = payload.get(collection)
+
+        if not isinstance(items, list):
+            return False
+
+        for item in items:
+            if not isinstance(item, dict):
+                return False
+
+            if not isinstance(
+                item.get(identity_key),
+                dict,
+            ):
+                return False
+
+    return True
 
 
 def _looks_like_trakt_json(

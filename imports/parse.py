@@ -61,7 +61,9 @@ SIMKL_STATUS_MAP: dict[str, ImportStatus] = {
     "completed": "completed",
     "plan to watch": "plan_to_watch",
     "plan_to_watch": "plan_to_watch",
+    "plantowatch": "plan_to_watch",
     "dropped": "dropped",
+    "hold": "on_hold",
     "on hold": "on_hold",
     "on_hold": "on_hold",
 }
@@ -119,10 +121,18 @@ def parse_import(
 
     elif detected.source == "simkl":
         data = candidate.read_bytes()
-        records = _parse_simkl_csv(
-            data,
-            logical_name,
-        )
+
+        if detected.inspection.kind == "json":
+            records = _parse_simkl_json(
+                data,
+                logical_name,
+            )
+        else:
+            records = _parse_simkl_csv(
+                data,
+                logical_name,
+            )
+
         source_files = [logical_name]
 
     elif detected.source == "letterboxd":
@@ -422,6 +432,325 @@ def _parse_simkl_csv(
         )
 
     return records
+
+
+def _parse_simkl_json(
+    data: bytes,
+    source_file: str,
+) -> list[NormalizedImportRecord]:
+    try:
+        payload = json.loads(
+            data.decode("utf-8-sig")
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ImportParseError(
+            f"Unable to parse Simkl JSON: {source_file}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise ImportParseError(
+            "Simkl JSON root must be an object."
+        )
+
+    collections = (
+        ("shows", "show"),
+        ("anime", "show"),
+        ("movies", "movie"),
+    )
+
+    records: list[
+        NormalizedImportRecord
+    ] = []
+
+    for collection, identity_key in collections:
+        items = payload.get(
+            collection,
+            [],
+        )
+
+        if not isinstance(items, list):
+            raise ImportParseError(
+                f"Simkl JSON collection is not a list: {collection}"
+            )
+
+        for item in items:
+            if not isinstance(item, dict):
+                raise ImportParseError(
+                    f"Simkl JSON {collection} item is not an object."
+                )
+
+            identity = item.get(
+                identity_key
+            )
+
+            if not isinstance(
+                identity,
+                dict,
+            ):
+                raise ImportParseError(
+                    f"Simkl JSON {collection} item lacks "
+                    f"{identity_key} identity."
+                )
+
+            records.extend(
+                _simkl_json_item_records(
+                    item,
+                    identity,
+                    collection=collection,
+                    source_file=source_file,
+                )
+            )
+
+    return records
+
+
+def _simkl_json_item_records(
+    item: dict[str, Any],
+    identity: dict[str, Any],
+    *,
+    collection: str,
+    source_file: str,
+) -> list[NormalizedImportRecord]:
+    ids = identity.get("ids")
+
+    if not isinstance(ids, dict):
+        ids = {}
+
+    media_type = _simkl_json_media_type(
+        item,
+        ids,
+        collection=collection,
+    )
+
+    raw_status = (
+        _clean(
+            item.get("status")
+        )
+        or ""
+    ).casefold()
+
+    status = SIMKL_STATUS_MAP.get(
+        raw_status
+    )
+
+    last_watched_at = _clean(
+        item.get("last_watched_at")
+    )
+
+    watched = (
+        bool(last_watched_at)
+        or status == "completed"
+    )
+
+    watchlist = (
+        status == "plan_to_watch"
+    )
+
+    # Kokabiel's film state is watched/watchlist rather than
+    # watching/completed. A completed Simkl movie therefore becomes
+    # watched without carrying a series-only "completed" state.
+    parent_status = status
+
+    if (
+        media_type == "movie"
+        and status == "completed"
+    ):
+        parent_status = None
+
+    tmdb_value: Any = ids.get(
+        "tmdb"
+    )
+
+    # Simkl uses tmdbm for some anime specials that resolve in TMDB's
+    # movie namespace rather than the TV namespace.
+    if (
+        collection == "anime"
+        and media_type == "movie"
+    ):
+        tmdb_value = (
+            ids.get("tmdbm")
+            or ids.get("tmdb")
+        )
+
+    rating = _bounded_float(
+        item.get("user_rating"),
+        minimum=1.0,
+        maximum=10.0,
+    )
+
+    common = {
+        "source": "simkl",
+        "title": _clean(
+            identity.get("title")
+        ),
+        "year": _year(
+            identity.get("year")
+        ),
+        "tmdb_id": _positive_int(
+            tmdb_value
+        ),
+        "imdb_id": _imdb_id(
+            ids.get("imdb")
+        ),
+        "tvdb_id": _positive_int(
+            ids.get("tvdb")
+        ),
+        "simkl_id": _positive_int(
+            ids.get("simkl")
+        ),
+        "source_file": source_file,
+    }
+
+    records = [
+        NormalizedImportRecord(
+            **common,
+            media_type=media_type,
+            watched=watched,
+            watched_at=last_watched_at,
+            watchlist=watchlist,
+            status=parent_status,
+            rating=rating,
+            rated_at=(
+                _clean(
+                    item.get(
+                        "user_rated_at"
+                    )
+                )
+                if rating is not None
+                else None
+            ),
+        )
+    ]
+
+    # Episode history is imported only when Simkl supplied explicit
+    # season/episode records. last_watched is never expanded into guessed
+    # preceding history.
+    if media_type != "tv":
+        return records
+
+    seasons = item.get(
+        "seasons",
+        [],
+    )
+
+    if seasons is None:
+        seasons = []
+
+    if not isinstance(
+        seasons,
+        list,
+    ):
+        raise ImportParseError(
+            "Simkl JSON seasons value is not a list."
+        )
+
+    for season_item in seasons:
+        if not isinstance(
+            season_item,
+            dict,
+        ):
+            raise ImportParseError(
+                "Simkl JSON season is not an object."
+            )
+
+        season_number = _positive_int(
+            season_item.get("number")
+        )
+
+        episodes = season_item.get(
+            "episodes",
+            [],
+        )
+
+        if not isinstance(
+            episodes,
+            list,
+        ):
+            raise ImportParseError(
+                "Simkl JSON episodes value is not a list."
+            )
+
+        for episode_item in episodes:
+            if not isinstance(
+                episode_item,
+                dict,
+            ):
+                raise ImportParseError(
+                    "Simkl JSON episode is not an object."
+                )
+
+            episode_number = (
+                _positive_int(
+                    episode_item.get(
+                        "number"
+                    )
+                )
+            )
+
+            if (
+                season_number is None
+                or episode_number is None
+            ):
+                raise ImportParseError(
+                    "Simkl JSON watched episode lacks "
+                    "season or episode number."
+                )
+
+            records.append(
+                NormalizedImportRecord(
+                    **common,
+                    media_type="episode",
+                    season=season_number,
+                    episode=episode_number,
+                    watched=True,
+                    watched_at=_clean(
+                        episode_item.get(
+                            "watched_at"
+                        )
+                    ),
+                )
+            )
+
+    return records
+
+
+def _simkl_json_media_type(
+    item: dict[str, Any],
+    ids: dict[str, Any],
+    *,
+    collection: str,
+) -> ImportedMediaType:
+    if collection == "movies":
+        return "movie"
+
+    if collection == "shows":
+        return "tv"
+
+    anime_type = (
+        _clean(
+            item.get("anime_type")
+        )
+        or ""
+    ).casefold()
+
+    if anime_type == "movie":
+        return "movie"
+
+    if (
+        anime_type == "special"
+        and _positive_int(
+            ids.get("tmdbm")
+        )
+        is not None
+    ):
+        return "movie"
+
+    # tv, ova and ona are episodic. Unknown anime forms remain TV-shaped
+    # rather than being silently converted into films.
+    return "tv"
 
 
 def _parse_letterboxd_zip(

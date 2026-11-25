@@ -95,7 +95,10 @@ def build_import_plan(
             bases[key],
             groups[key],
         )
-        for key in sorted(groups)
+        for key in sorted(
+            groups,
+            key=_plan_group_sort_key,
+        )
     )
 
     return ImportPlan(
@@ -104,6 +107,39 @@ def build_import_plan(
             parsed.records
         ),
         items=items,
+    )
+
+
+def _plan_group_sort_key(
+    key: str,
+) -> tuple[int, str]:
+    """
+    Keep deterministic import planning while processing parent media
+    before granular season/episode history.
+
+    This lets a parent TV record establish its final state first so later
+    episode-union records do not create an unnecessary intermediate
+    Watching -> Completed update.
+    """
+
+    granularity = key.split(
+        ":",
+        1,
+    )[0]
+
+    rank = {
+        "movie": 0,
+        "tv": 0,
+        "season": 1,
+        "episode": 2,
+    }.get(
+        granularity,
+        3,
+    )
+
+    return (
+        rank,
+        key,
     )
 
 
