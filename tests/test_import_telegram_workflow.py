@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram.constants import ChatType
 
+from imports.selective import SelectiveImportPreview
+
 from handlers.imports import (
     IMPORT_SESSION_KEY,
     PendingImport,
@@ -791,8 +793,12 @@ class ImportTelegramApprovalTests(
                     ),
                 ),
                 patch(
-                    "handlers.imports.preview_database_import",
-                    return_value=expected_preview,
+                    "handlers.imports.preview_selective_database_import",
+                    return_value=SelectiveImportPreview(
+                        full=expected_preview,
+                        eligible=expected_preview,
+                        excluded=(),
+                    ),
                 ),
                 patch(
                     "handlers.imports.reply_personal_text",

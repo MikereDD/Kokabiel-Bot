@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path, PurePosixPath
 from secrets import token_hex
 from typing import Literal
@@ -15,6 +16,7 @@ from telegram import (
 )
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
+from telegram.error import TelegramError
 
 from handlers.common import (
     allowed,
@@ -30,12 +32,19 @@ from imports.db_apply import (
 )
 from imports.db_preview import (
     ImportDatabasePreview,
-    preview_database_import,
+    load_existing_user_snapshot,
 )
 from imports.detect import ImportDetectionError
 from imports.merge import analyze_import
 from imports.parse import ImportParseError
-from imports.resolve import resolve_import_plan
+from imports.resolve import (
+    ResolutionPreview,
+    resolve_import_plan,
+)
+from imports.selective import (
+    SelectiveImportPreview,
+    build_selective_import_preview,
+)
 from imports.security import (
     ALLOWED_UPLOAD_SUFFIXES,
     DEFAULT_LIMITS,
@@ -54,6 +63,8 @@ ImportSessionState = Literal[
     "awaiting_upload",
     "processing",
     "ready",
+    "preparing_verified",
+    "verified_ready",
     "applying",
 ]
 
@@ -89,10 +100,6 @@ async def import_command(
         ChatType.GROUP,
         ChatType.SUPERGROUP,
     }:
-        _discard_pending_import(
-            context
-        )
-
         await reply_personal_text(
             update,
             context,
@@ -111,6 +118,29 @@ async def import_command(
         return
 
     if chat.type != ChatType.PRIVATE:
+        return
+
+    current = context.user_data.get(
+        IMPORT_SESSION_KEY
+    )
+
+    if (
+        isinstance(current, PendingImport)
+        and current.state in {
+            "processing",
+            "preparing_verified",
+            "applying",
+        }
+    ):
+        await reply_personal_text(
+            update,
+            context,
+            (
+                "An import operation is already in progress. "
+                "Please allow it to complete before starting "
+                "another import."
+            ),
+        )
         return
 
     _discard_pending_import(
@@ -150,6 +180,44 @@ async def import_command(
         ),
         parse_mode="HTML",
     )
+
+
+async def _run_import_worker(function, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+
+    worker = loop.run_in_executor(
+        None,
+        partial(function, *args, **kwargs),
+    )
+
+    try:
+        return await asyncio.shield(worker)
+
+    except asyncio.CancelledError:
+        # Cancelling the awaiting coroutine does not stop
+        # an already-running executor thread.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+
+            except asyncio.CancelledError:
+                continue
+
+            except Exception:
+                break
+
+        # Retrieve any worker exception before propagating
+        # the original cancellation.
+        if not worker.cancelled():
+            try:
+                worker.result()
+
+            except Exception:
+                LOGGER.exception(
+                    "Import worker failed during cancellation"
+                )
+
+        raise
 
 
 async def receive_import_document(
@@ -202,14 +270,20 @@ async def receive_import_document(
     ):
         return
 
+    if context.user_data.get(
+        IMPORT_SESSION_KEY
+    ) is not pending:
+        return
+
     if pending.state != "awaiting_upload":
         await reply_personal_text(
             update,
             context,
             (
                 "An import is already being processed or "
-                "waiting for your decision. Use its buttons, "
-                "or run /import again to replace it."
+                "waiting for your decision. Wait for active "
+                "operations to finish before starting another "
+                "import, or use the available preview buttons."
             ),
         )
         return
@@ -292,7 +366,7 @@ async def receive_import_document(
             0o600
         )
 
-        plan = await asyncio.to_thread(
+        plan = await _run_import_worker(
             analyze_import,
             str(upload_path),
             source_name=source_name,
@@ -305,14 +379,16 @@ async def receive_import_document(
             )
         )
 
-        preview = await asyncio.to_thread(
-            preview_database_import,
+        selective = await asyncio.to_thread(
+            preview_selective_database_import,
             resolution,
             database_path=settings(
                 context
             ).database_path,
             user_id=pending.user_id,
         )
+
+        preview = selective.full
 
         # The transactional writer needs only the approved preview.
         # Do not retain a member's raw tracker export while they decide.
@@ -324,6 +400,16 @@ async def receive_import_document(
             processing,
             path=None,
         )
+
+    except asyncio.CancelledError:
+        _delete_path(upload_path)
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is processing:
+            _discard_pending_import(context)
+
+        raise
 
     except (
         ImportSecurityError,
@@ -415,24 +501,117 @@ async def receive_import_document(
         preview=preview,
     )
 
+    # Keep the session non-actionable while delivering
+    # its initial preview. The raw upload is already removed.
     context.user_data[
         IMPORT_SESSION_KEY
-    ] = ready
+    ] = processing
 
-    await reply_personal_text(
-        update,
-        context,
-        format_import_preview(
-            preview
-        ),
-        parse_mode="HTML",
-        reply_markup=(
-            import_preview_keyboard(
-                preview,
-                pending.token,
-            )
+    try:
+        await reply_personal_text(
+            update,
+            context,
+            format_import_preview(
+                preview
+            ),
+            parse_mode="HTML",
+            reply_markup=(
+                import_preview_keyboard(
+                    preview,
+                    pending.token,
+                    selective=selective,
+                )
+            ),
+        )
+
+    except asyncio.CancelledError:
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is processing:
+            _discard_pending_import(context)
+
+        raise
+
+    except TelegramError:
+        LOGGER.warning(
+            "Import preview delivery failed for user %s",
+            pending.user_id,
+        )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is processing:
+            _discard_pending_import(context)
+
+        return
+
+    if context.user_data.get(
+        IMPORT_SESSION_KEY
+    ) is processing:
+        context.user_data[
+            IMPORT_SESSION_KEY
+        ] = ready
+
+
+def preview_selective_database_import(
+    resolution: ResolutionPreview,
+    *,
+    database_path: str | Path,
+    user_id: int,
+) -> SelectiveImportPreview:
+    snapshot = load_existing_user_snapshot(
+        database_path,
+        user_id,
+    )
+
+    return build_selective_import_preview(
+        resolution,
+        snapshot,
+    )
+
+
+def refresh_selective_import_preview(
+    preview: ImportDatabasePreview,
+    *,
+    database_path: str | Path,
+    user_id: int,
+) -> SelectiveImportPreview:
+    if preview.user_id != user_id:
+        raise ValueError(
+            "Import preview ownership mismatch."
+        )
+
+    resolution = ResolutionPreview(
+        source=preview.source,
+        raw_record_count=preview.raw_record_count,
+        items=tuple(
+            item.resolution
+            for item in preview.items
         ),
     )
+
+    return preview_selective_database_import(
+        resolution,
+        database_path=database_path,
+        user_id=user_id,
+    )
+
+
+async def _edit_import_message_safely(
+    query,
+    text: str,
+    **kwargs,
+) -> None:
+    try:
+        await query.edit_message_text(
+            text,
+            **kwargs,
+        )
+
+    except TelegramError:
+        LOGGER.warning(
+            "Import status message delivery failed"
+        )
 
 
 async def import_callback_router(
@@ -500,6 +679,17 @@ async def import_callback_router(
         )
         return
 
+    if pending.state in {
+        "processing",
+        "preparing_verified",
+        "applying",
+    }:
+        await query.answer(
+            "An import operation is already in progress.",
+            show_alert=True,
+        )
+        return
+
     if action == "cancel":
         _discard_pending_import(
             context
@@ -515,7 +705,10 @@ async def import_callback_router(
         return
 
     if (
-        pending.state != "ready"
+        pending.state not in {
+            "ready",
+            "verified_ready",
+        }
         or pending.preview is None
     ):
         await query.answer(
@@ -525,6 +718,148 @@ async def import_callback_router(
         return
 
     preview = pending.preview
+
+    if action == "prepare_verified":
+        if (
+            pending.state != "ready"
+            or not preview.review_count
+            or preview.user_id != pending.user_id
+        ):
+            await query.answer(
+                "This preview cannot prepare a verified import.",
+                show_alert=True,
+            )
+            return
+
+        preparing = replace(
+            pending,
+            state="preparing_verified",
+        )
+
+        context.user_data[
+            IMPORT_SESSION_KEY
+        ] = preparing
+
+        confirmation = None
+
+        try:
+            await query.answer(
+                "Preparing verified records…"
+            )
+
+            selective = await asyncio.to_thread(
+                refresh_selective_import_preview,
+                preview,
+                database_path=settings(
+                    context
+                ).database_path,
+                user_id=pending.user_id,
+            )
+
+            # Never revive a replaced or invalidated session.
+            if context.user_data.get(
+                IMPORT_SESSION_KEY
+            ) is not preparing:
+                return
+
+            # Fail closed if database changes altered the full
+            # preview or the selective subset is unavailable.
+            if (
+                selective.full != preview
+                or not selective_import_available(selective)
+            ):
+                _discard_pending_import(context)
+
+                await _edit_import_message_safely(
+                    query,
+                    "The import preview changed or no verified "
+                    "changes remain. Run /import again."
+                )
+                return
+
+            confirmation_token = token_hex(16)
+
+            if confirmation_token == pending.token:
+                raise RuntimeError(
+                    "Confirmation token was not rotated."
+                )
+
+            confirmation = replace(
+                pending,
+                token=confirmation_token,
+                state="verified_ready",
+                preview=selective.eligible,
+            )
+
+            await query.edit_message_text(
+                format_selective_import_preview(
+                    selective
+                ),
+                reply_markup=selective_import_keyboard(
+                    confirmation_token
+                ),
+                parse_mode="HTML",
+            )
+
+            if context.user_data.get(
+                IMPORT_SESSION_KEY
+            ) is preparing:
+                context.user_data[
+                    IMPORT_SESSION_KEY
+                ] = confirmation
+
+        except asyncio.CancelledError:
+            current = context.user_data.get(
+                IMPORT_SESSION_KEY
+            )
+
+            if (
+                current is preparing
+                or (
+                    confirmation is not None
+                    and current is confirmation
+                )
+            ):
+                _discard_pending_import(context)
+
+            raise
+
+        except Exception:
+            LOGGER.exception(
+                "Verified import preparation failed for user %s",
+                pending.user_id,
+            )
+
+            current = context.user_data.get(
+                IMPORT_SESSION_KEY
+            )
+
+            if (
+                current is preparing
+                or (
+                    confirmation is not None
+                    and current is confirmation
+                )
+            ):
+                _discard_pending_import(context)
+
+                await _edit_import_message_safely(
+                    query,
+                    "Kokabiel could not prepare a verified "
+                    "import safely. Run /import again."
+                )
+
+        return
+
+    if (
+        pending.state == "verified_ready"
+        and action != "apply_verified"
+    ):
+        await query.answer(
+            "This confirmation authorizes only a verified import.",
+            show_alert=True,
+        )
+        return
 
     if action == "review":
         if not preview.review_count:
@@ -543,9 +878,25 @@ async def import_callback_router(
         )
         return
 
-    if action != "apply":
+    expected_action = (
+        "apply_verified"
+        if pending.state == "verified_ready"
+        else "apply"
+    )
+
+    if action != expected_action:
         await query.answer(
             "That import action is not valid.",
+            show_alert=True,
+        )
+        return
+
+    if (
+        pending.state == "verified_ready"
+        and preview.user_id != pending.user_id
+    ):
+        await query.answer(
+            "That verified preview belongs to another user.",
             show_alert=True,
         )
         return
@@ -567,20 +918,6 @@ async def import_callback_router(
         )
         return
 
-    current_settings = settings(
-        context
-    )
-
-    backup_path = _backup_path(
-        current_settings.database_path,
-        pending.user_id,
-        pending.token,
-    )
-
-    _prepare_backup_directory(
-        backup_path.parent
-    )
-
     applying = replace(
         pending,
         state="applying",
@@ -590,12 +927,59 @@ async def import_callback_router(
         IMPORT_SESSION_KEY
     ] = applying
 
-    await query.answer(
-        "Applying approved import…"
-    )
+    try:
+        await query.answer(
+            "Applying approved import…"
+        )
+
+    except asyncio.CancelledError:
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is applying:
+            _discard_pending_import(context)
+
+        raise
+
+    except TelegramError:
+        LOGGER.warning(
+            "Import acknowledgement failed for user %s",
+            pending.user_id,
+        )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is applying:
+            _discard_pending_import(context)
+
+        await _edit_import_message_safely(
+            query,
+            "Import could not start. No changes were made. "
+            "Run /import again."
+        )
+
+        return
+
+    if context.user_data.get(
+        IMPORT_SESSION_KEY
+    ) is not applying:
+        return
 
     try:
-        result = await asyncio.to_thread(
+        current_settings = settings(
+            context
+        )
+
+        backup_path = _backup_path(
+            current_settings.database_path,
+            pending.user_id,
+            pending.token,
+        )
+
+        _prepare_backup_directory(
+            backup_path.parent
+        )
+
+        result = await _run_import_worker(
             apply_database_import,
             preview,
             database_path=(
@@ -606,12 +990,27 @@ async def import_callback_router(
             chat_id=pending.chat_id,
         )
 
+    except asyncio.CancelledError:
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is applying:
+            _discard_pending_import(context)
+
+        LOGGER.warning(
+            "Import handler cancelled after worker completion "
+            "for user %s",
+            pending.user_id,
+        )
+
+        raise
+
     except ImportPreviewStaleError:
         _discard_pending_import(
             context
         )
 
-        await query.edit_message_text(
+        await _edit_import_message_safely(
+            query,
             (
                 "The database changed after this preview was created. "
                 "Nothing further was attempted from this preview. "
@@ -630,7 +1029,8 @@ async def import_callback_router(
             context
         )
 
-        await query.edit_message_text(
+        await _edit_import_message_safely(
+            query,
             (
                 "Kokabiel could not complete this import safely. "
                 "Run /import again before retrying."
@@ -648,7 +1048,8 @@ async def import_callback_router(
             context
         )
 
-        await query.edit_message_text(
+        await _edit_import_message_safely(
+            query,
             (
                 "Kokabiel could not verify that this import completed "
                 "normally. Run /import again before retrying."
@@ -660,7 +1061,8 @@ async def import_callback_router(
         context
     )
 
-    await query.edit_message_text(
+    await _edit_import_message_safely(
+        query,
         format_import_result(
             result
         ),
@@ -812,6 +1214,8 @@ def format_import_preview(
 def import_preview_keyboard(
     preview: ImportDatabasePreview,
     token: str,
+    *,
+    selective: SelectiveImportPreview | None = None,
 ) -> InlineKeyboardMarkup:
     has_changes = any(
         item.has_changes
@@ -823,6 +1227,22 @@ def import_preview_keyboard(
     ] = []
 
     if preview.review_count:
+        if (
+            selective is not None
+            and selective.full == preview
+            and selective_import_available(selective)
+        ):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "📥 Prepare Verified Import",
+                        callback_data=(
+                            f"imp|prepare_verified|{token}"
+                        ),
+                    )
+                ]
+            )
+
         rows.append(
             [
                 InlineKeyboardButton(
@@ -859,6 +1279,88 @@ def import_preview_keyboard(
 
     return InlineKeyboardMarkup(
         rows
+    )
+
+
+def selective_import_available(
+    selective: SelectiveImportPreview,
+) -> bool:
+    return (
+        selective.full.review_count > 0
+        and bool(selective.excluded)
+        and selective.eligible.review_count == 0
+        and selective.full.user_id == selective.eligible.user_id
+        and selective.full.source == selective.eligible.source
+        and any(
+            item.has_changes
+            for item in selective.eligible.items
+        )
+    )
+
+
+def selective_import_keyboard(
+    token: str,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Import Verified Records",
+                    callback_data=(
+                        f"imp|apply_verified|{token}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data=(
+                        f"imp|cancel|{token}"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+def format_selective_import_preview(
+    selective: SelectiveImportPreview,
+) -> str:
+    eligible = selective.eligible
+
+    return "\n".join(
+        [
+            "📥 <b>Confirm verified import</b>",
+            "",
+            f"<b>Source:</b> {eligible.source.capitalize()}",
+            "",
+            "<b>Import scope</b>",
+            f"• Total source records: {selective.full.raw_record_count}",
+            f"• Eligible source records: {eligible.raw_record_count}",
+            f"• Excluded source records: {selective.excluded_raw_record_count}",
+            f"• Eligible merged items: {len(eligible.items)}",
+            f"• Excluded merged items: {len(selective.excluded)}",
+            f"• Review-required items: {selective.full.review_count}",
+            f"• Dependency-excluded items: {selective.dependency_excluded_count}",
+            "",
+            "<b>Planned database changes</b>",
+            f"• New catalog rows: {eligible.media_add_count}",
+            f"• Personal states added: {eligible.state_add_count}",
+            f"• Personal states updated: {eligible.state_update_count}",
+            f"• Episodes added: {eligible.episode_add_count}",
+            f"• Ratings added: {eligible.rating_add_count}",
+            f"• Unchanged/skipped: {eligible.skip_count}",
+            "",
+            "🛡 <b>Import safeguards</b>",
+            "Excluded records and their linked dependencies "
+            "are outside this approval.",
+            "Existing ratings and episode history are protected "
+            "by transactional validation.",
+            "",
+            "No changes have been written.",
+            "Choose <b>Import Verified Records</b> to approve "
+            "only this exact eligible preview.",
+        ]
     )
 
 
