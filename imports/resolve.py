@@ -184,6 +184,16 @@ async def _resolve_item(
 ) -> ResolvedImportItem:
     record = item.proposed
 
+    if record.episode_mapping_unverified:
+        return _review(
+            item,
+            reason=(
+                "Simkl anime episode numbering has not "
+                "been verified against TMDB. Episode "
+                "history requires review."
+            ),
+        )
+
     identity_conflicts = {
         conflict.field
         for conflict in item.conflicts

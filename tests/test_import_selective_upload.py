@@ -1572,5 +1572,973 @@ class SelectiveUploadTests(
         self.writer.assert_called_once()
 
 
+    def replacement_session(self):
+        from dataclasses import replace
+
+        return replace(
+            self.pending,
+            token="replacement-session",
+            state="awaiting_upload",
+            path=None,
+            preview=None,
+        )
+
+    async def test_hardening_token_entropy(self):
+        with patch.object(
+            workflow,
+            "token_hex",
+            wraps=workflow.token_hex,
+        ) as generator:
+            await workflow.import_command(
+                self.update,
+                self.context,
+            )
+
+        initial = self.current_session()
+
+        self.assertIsNotNone(initial)
+
+        generator.assert_called_once_with(16)
+
+        self.assertRegex(
+            initial.token,
+            r"^[0-9a-f]{32}$",
+        )
+
+        selective = build_selective_import_preview(
+            self.mixed_source(),
+            self.snapshot(),
+        )
+
+        markup = workflow.import_preview_keyboard(
+            selective.full,
+            initial.token,
+            selective=selective,
+        )
+
+        for row in markup.inline_keyboard:
+            for button in row:
+                self.assertLessEqual(
+                    len(button.callback_data.encode("utf-8")),
+                    64,
+                )
+
+        from dataclasses import replace
+
+        self.context.user_data[
+            workflow.IMPORT_SESSION_KEY
+        ] = replace(
+            initial,
+            state="ready",
+            preview=selective.full,
+        )
+
+        with patch.object(
+            workflow,
+            "token_hex",
+            wraps=workflow.token_hex,
+        ) as generator:
+            query = await self.callback(
+                "prepare_verified",
+                initial.token,
+            )
+
+        confirmation = self.current_session()
+
+        self.assertIsNotNone(confirmation)
+
+        self.assertEqual(
+            confirmation.state,
+            "verified_ready",
+        )
+
+        generator.assert_called_once_with(16)
+
+        self.assertRegex(
+            confirmation.token,
+            r"^[0-9a-f]{32}$",
+        )
+
+        self.assertNotEqual(
+            confirmation.token,
+            initial.token,
+        )
+
+        markup = (
+            query.edit_message_text
+            .await_args.kwargs["reply_markup"]
+        )
+
+        for row in markup.inline_keyboard:
+            for button in row:
+                self.assertLessEqual(
+                    len(button.callback_data.encode("utf-8")),
+                    64,
+                )
+
+        self.writer.assert_not_called()
+
+    async def test_hardening_unexpected_preview_delivery(self):
+        before = self.database.read_bytes()
+
+        self.reply.side_effect = RuntimeError(
+            "Synthetic preview delivery failure"
+        )
+
+        with patch.object(
+            workflow,
+            "resolve_import_plan",
+            new=AsyncMock(
+                return_value=self.mixed_source()
+            ),
+        ):
+            await workflow.receive_import_document(
+                self.update,
+                self.context,
+            )
+
+        self.assertIsNone(
+            self.current_session()
+        )
+
+        self.writer.assert_not_called()
+
+        self.assertEqual(
+            self.database.read_bytes(),
+            before,
+        )
+
+        upload = workflow._quarantine_path(
+            self.database,
+            1,
+            "original",
+            "ratings.csv",
+        )
+
+        self.assertFalse(upload.exists())
+
+        self.assert_rejected(
+            await self.callback(
+                "prepare_verified",
+                "original",
+            )
+        )
+
+    async def assert_unexpected_acknowledgement(
+        self,
+        action,
+        token,
+    ):
+        before = self.database.read_bytes()
+
+        query = SimpleNamespace(
+            data=f"imp|{action}|{token}",
+            answer=AsyncMock(
+                side_effect=RuntimeError(
+                    "Synthetic acknowledgement failure"
+                )
+            ),
+            edit_message_text=AsyncMock(),
+        )
+
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=self.update.effective_chat,
+            effective_user=self.update.effective_user,
+        )
+
+        await workflow.import_callback_router(
+            update,
+            self.context,
+        )
+
+        self.assertIsNone(
+            self.current_session()
+        )
+
+        self.writer.assert_not_called()
+
+        self.assertEqual(
+            self.database.read_bytes(),
+            before,
+        )
+
+        self.assertFalse(
+            (
+                self.database.parent
+                / "imports"
+                / "backups"
+            ).exists()
+        )
+
+        self.assert_rejected(
+            await self.callback(
+                action,
+                token,
+            )
+        )
+
+    async def test_hardening_unexpected_ordinary_acknowledgement(
+        self,
+    ):
+        await self.upload(
+            resolution(
+                resolved(
+                    "movie",
+                    100,
+                    "Verified Film",
+                )
+            )
+        )
+
+        await self.assert_unexpected_acknowledgement(
+            "apply",
+            "original",
+        )
+
+    async def test_hardening_unexpected_verified_acknowledgement(
+        self,
+    ):
+        await self.upload(
+            self.mixed_source()
+        )
+
+        confirmation = (
+            await self.prepare_confirmation()
+        )
+
+        await self.assert_unexpected_acknowledgement(
+            "apply_verified",
+            confirmation.token,
+        )
+
+    async def test_hardening_upload_failure_preserves_newer_session(
+        self,
+    ):
+        errors = (
+            workflow.ImportSecurityError,
+            workflow.ImportParseError,
+            workflow.TmdbError,
+            RuntimeError,
+        )
+
+        before = self.database.read_bytes()
+
+        for error_type in errors:
+            with self.subTest(error=error_type.__name__):
+                self.context.user_data[
+                    workflow.IMPORT_SESSION_KEY
+                ] = self.pending
+
+                newer = self.replacement_session()
+
+                async def fail_resolution(*args, **kwargs):
+                    self.context.user_data[
+                        workflow.IMPORT_SESSION_KEY
+                    ] = newer
+
+                    if error_type is workflow.ImportSecurityError:
+                        raise error_type(
+                            "synthetic_security_error",
+                            "Synthetic resolution failure",
+                        )
+
+                    raise error_type(
+                        "Synthetic resolution failure"
+                    )
+
+                with patch.object(
+                    workflow,
+                    "resolve_import_plan",
+                    new=AsyncMock(
+                        side_effect=fail_resolution
+                    ),
+                ):
+                    await workflow.receive_import_document(
+                        self.update,
+                        self.context,
+                    )
+
+                self.assertIs(
+                    self.current_session(),
+                    newer,
+                )
+
+                self.writer.assert_not_called()
+
+                self.assertEqual(
+                    self.database.read_bytes(),
+                    before,
+                )
+
+                upload = workflow._quarantine_path(
+                    self.database,
+                    1,
+                    "original",
+                    "ratings.csv",
+                )
+
+                self.assertFalse(upload.exists())
+
+    async def test_hardening_upload_success_preserves_newer_session(
+        self,
+    ):
+        before = self.database.read_bytes()
+        newer = self.replacement_session()
+
+        async def replace_during_resolution(*args, **kwargs):
+            self.context.user_data[
+                workflow.IMPORT_SESSION_KEY
+            ] = newer
+
+            return self.mixed_source()
+
+        with patch.object(
+            workflow,
+            "resolve_import_plan",
+            new=AsyncMock(
+                side_effect=replace_during_resolution
+            ),
+        ):
+            await workflow.receive_import_document(
+                self.update,
+                self.context,
+            )
+
+        self.assertIs(
+            self.current_session(),
+            newer,
+        )
+
+        self.reply.assert_not_awaited()
+        self.writer.assert_not_called()
+
+        self.assertEqual(
+            self.database.read_bytes(),
+            before,
+        )
+
+        upload = workflow._quarantine_path(
+            self.database,
+            1,
+            "original",
+            "ratings.csv",
+        )
+
+        self.assertFalse(upload.exists())
+
+    async def test_hardening_apply_preserves_newer_session(
+        self,
+    ):
+        await self.upload(
+            resolution(
+                resolved(
+                    "movie",
+                    100,
+                    "Verified Film",
+                )
+            )
+        )
+
+        ready = self.current_session()
+        before = self.database.read_bytes()
+
+        outcomes = (
+            workflow.ImportPreviewStaleError,
+            workflow.ImportApplyError,
+            RuntimeError,
+            None,
+        )
+
+        for error_type in outcomes:
+            with self.subTest(outcome=error_type):
+                self.context.user_data[
+                    workflow.IMPORT_SESSION_KEY
+                ] = ready
+
+                newer = self.replacement_session()
+
+                async def finish_worker(*args, **kwargs):
+                    self.context.user_data[
+                        workflow.IMPORT_SESSION_KEY
+                    ] = newer
+
+                    if error_type is not None:
+                        raise error_type(
+                            "Synthetic worker failure"
+                        )
+
+                    return SimpleNamespace(
+                        already_applied=True
+                    )
+
+                with patch.object(
+                    workflow,
+                    "_run_import_worker",
+                    new=AsyncMock(
+                        side_effect=finish_worker
+                    ),
+                ):
+                    await self.callback(
+                        "apply",
+                        "original",
+                    )
+
+                self.assertIs(
+                    self.current_session(),
+                    newer,
+                )
+
+                self.writer.assert_not_called()
+
+                self.assertEqual(
+                    self.database.read_bytes(),
+                    before,
+                )
+
+    async def test_hardening_ordinary_preview_ownership(
+        self,
+    ):
+        from dataclasses import replace
+
+        await self.upload(
+            resolution(
+                resolved(
+                    "movie",
+                    100,
+                    "Verified Film",
+                )
+            )
+        )
+
+        ready = self.current_session()
+        before = self.database.read_bytes()
+
+        self.context.user_data[
+            workflow.IMPORT_SESSION_KEY
+        ] = replace(
+            ready,
+            preview=replace(
+                ready.preview,
+                user_id=2,
+            ),
+        )
+
+        query = await self.callback(
+            "apply",
+            "original",
+        )
+
+        self.assert_rejected(query)
+
+        self.writer.assert_not_called()
+
+        self.assertEqual(
+            self.database.read_bytes(),
+            before,
+        )
+
+
+    async def extended_callback(
+        self,
+        action,
+        token,
+        *,
+        answer=None,
+        edit=None,
+    ):
+        query = SimpleNamespace(
+            data=f"imp|{action}|{token}",
+            answer=answer if answer is not None else AsyncMock(),
+            edit_message_text=(
+                edit if edit is not None else AsyncMock()
+            ),
+        )
+
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=self.update.effective_chat,
+            effective_user=self.update.effective_user,
+        )
+
+        await workflow.import_callback_router(
+            update,
+            self.context,
+        )
+
+        return query
+
+    async def test_extended_replacement_during_acknowledgement(
+        self,
+    ):
+        await self.upload(
+            resolution(
+                resolved(
+                    "movie",
+                    100,
+                    "Verified Film",
+                )
+            )
+        )
+
+        ready = self.current_session()
+        before = self.database.read_bytes()
+
+        for fail in (False, True):
+            with self.subTest(acknowledgement_failure=fail):
+                self.context.user_data[
+                    workflow.IMPORT_SESSION_KEY
+                ] = ready
+
+                newer = self.replacement_session()
+
+                async def acknowledge(*args, **kwargs):
+                    self.context.user_data[
+                        workflow.IMPORT_SESSION_KEY
+                    ] = newer
+
+                    if fail:
+                        raise RuntimeError(
+                            "Synthetic obsolete acknowledgement"
+                        )
+
+                query = await self.extended_callback(
+                    "apply",
+                    ready.token,
+                    answer=AsyncMock(
+                        side_effect=acknowledge
+                    ),
+                )
+
+                self.assertIs(
+                    self.current_session(),
+                    newer,
+                )
+
+                self.writer.assert_not_called()
+                query.edit_message_text.assert_not_awaited()
+
+                self.assertEqual(
+                    self.database.read_bytes(),
+                    before,
+                )
+
+                self.assertFalse(
+                    (
+                        self.database.parent
+                        / "imports"
+                        / "backups"
+                    ).exists()
+                )
+
+    async def test_extended_replacement_during_preview_delivery(
+        self,
+    ):
+        before = self.database.read_bytes()
+
+        for fail in (False, True):
+            with self.subTest(delivery_failure=fail):
+                self.context.user_data[
+                    workflow.IMPORT_SESSION_KEY
+                ] = self.pending
+
+                newer = self.replacement_session()
+
+                async def deliver(*args, **kwargs):
+                    self.context.user_data[
+                        workflow.IMPORT_SESSION_KEY
+                    ] = newer
+
+                    if fail:
+                        raise RuntimeError(
+                            "Synthetic obsolete preview delivery"
+                        )
+
+                self.reply.side_effect = deliver
+
+                with patch.object(
+                    workflow,
+                    "resolve_import_plan",
+                    new=AsyncMock(
+                        return_value=self.mixed_source()
+                    ),
+                ):
+                    await workflow.receive_import_document(
+                        self.update,
+                        self.context,
+                    )
+
+                self.assertIs(
+                    self.current_session(),
+                    newer,
+                )
+
+                self.writer.assert_not_called()
+
+                self.assertEqual(
+                    self.database.read_bytes(),
+                    before,
+                )
+
+                upload = workflow._quarantine_path(
+                    self.database,
+                    1,
+                    "original",
+                    "ratings.csv",
+                )
+
+                self.assertFalse(upload.exists())
+
+                self.assert_rejected(
+                    await self.callback(
+                        "prepare_verified",
+                        "original",
+                    )
+                )
+
+    async def test_extended_unexpected_preparation_failure(
+        self,
+    ):
+        await self.upload(
+            self.mixed_source()
+        )
+
+        ready = self.current_session()
+        before = self.database.read_bytes()
+
+        for failure_point in ("answer", "edit"):
+            with self.subTest(failure_point=failure_point):
+                self.context.user_data[
+                    workflow.IMPORT_SESSION_KEY
+                ] = ready
+
+                failure = AsyncMock(
+                    side_effect=RuntimeError(
+                        "Synthetic preparation delivery failure"
+                    )
+                )
+
+                await self.extended_callback(
+                    "prepare_verified",
+                    ready.token,
+                    answer=(
+                        failure
+                        if failure_point == "answer"
+                        else None
+                    ),
+                    edit=(
+                        failure
+                        if failure_point == "edit"
+                        else None
+                    ),
+                )
+
+                self.assertIsNone(
+                    self.current_session()
+                )
+
+                self.writer.assert_not_called()
+
+                self.assertEqual(
+                    self.database.read_bytes(),
+                    before,
+                )
+
+                self.assert_rejected(
+                    await self.callback(
+                        "prepare_verified",
+                        ready.token,
+                    )
+                )
+
+    async def test_extended_confirmation_token_collision(
+        self,
+    ):
+        await self.upload(
+            self.mixed_source()
+        )
+
+        ready = self.current_session()
+        before = self.database.read_bytes()
+
+        with patch.object(
+            workflow,
+            "token_hex",
+            return_value=ready.token,
+        ) as generator:
+            await self.callback(
+                "prepare_verified",
+                ready.token,
+            )
+
+        generator.assert_called_once_with(16)
+
+        self.assertIsNone(
+            self.current_session()
+        )
+
+        self.writer.assert_not_called()
+
+        self.assertEqual(
+            self.database.read_bytes(),
+            before,
+        )
+
+        for action in ("prepare_verified", "apply_verified", "apply"):
+            self.assert_rejected(
+                await self.callback(
+                    action,
+                    ready.token,
+                )
+            )
+
+    async def test_extended_unexpected_result_delivery_after_commit(
+        self,
+    ):
+        await self.upload(
+            self.mixed_source()
+        )
+
+        confirmation = (
+            await self.prepare_confirmation()
+        )
+
+        self.enable_real_writer()
+
+        await self.extended_callback(
+            "apply_verified",
+            confirmation.token,
+            edit=AsyncMock(
+                side_effect=RuntimeError(
+                    "Synthetic post-commit delivery failure"
+                )
+            ),
+        )
+
+        self.writer.assert_called_once()
+
+        self.assertIsNone(
+            self.current_session()
+        )
+
+        committed = self.snapshot()
+
+        self.assertIn(
+            ("movie", 100),
+            committed.states,
+        )
+
+        self.assertEqual(
+            committed.ratings[("movie", 100)].rating,
+            9,
+        )
+
+        self.assertEqual(
+            committed.states[("tv", 300)].viewing_status,
+            "completed",
+        )
+
+        self.assertEqual(
+            committed.episodes[300],
+            frozenset({(1, 2)}),
+        )
+
+        self.assertNotIn(
+            ("tv", 200),
+            committed.states,
+        )
+
+        self.assertNotIn(
+            ("tv", 200),
+            committed.ratings,
+        )
+
+        self.assertNotIn(
+            200,
+            committed.episodes,
+        )
+
+        self.assert_rejected(
+            await self.callback(
+                "apply_verified",
+                confirmation.token,
+            )
+        )
+
+        self.writer.assert_called_once()
+
+        self.assertEqual(
+            self.snapshot(),
+            committed,
+        )
+
+
+    async def test_diagnostics_backup_collision(self):
+        await self.upload(self.mixed_source())
+
+        confirmation = await self.prepare_confirmation()
+
+        before = self.snapshot()
+
+        backup = workflow._backup_path(
+            self.database,
+            1,
+            confirmation.token,
+        )
+
+        backup.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        sentinel = b"Existing backup sentinel"
+        backup.write_bytes(sentinel)
+
+        self.enable_real_writer()
+
+        query = await self.callback(
+            "apply_verified",
+            confirmation.token,
+        )
+
+        self.writer.assert_called_once()
+
+        self.assertIsNone(self.current_session())
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(backup.read_bytes(), sentinel)
+
+        message = query.edit_message_text.await_args.args[0]
+
+        self.assertIn("backup", message.casefold())
+        self.assertIn("No import changes were made.", message)
+        self.assertNotIn(str(backup), message)
+
+        self.assert_rejected(
+            await self.callback(
+                "apply_verified",
+                confirmation.token,
+            )
+        )
+
+        self.writer.assert_called_once()
+
+    async def test_diagnostics_prewrite_failure(self):
+        from imports.db_apply import ImportPreWriteError
+
+        await self.upload(self.mixed_source())
+
+        confirmation = await self.prepare_confirmation()
+
+        before = self.snapshot()
+
+        self.writer.side_effect = ImportPreWriteError(
+            "Synthetic database lock"
+        )
+
+        query = await self.callback(
+            "apply_verified",
+            confirmation.token,
+        )
+
+        self.writer.assert_called_once()
+
+        self.assertIsNone(self.current_session())
+        self.assertEqual(self.snapshot(), before)
+
+        message = query.edit_message_text.await_args.args[0]
+
+        self.assertIn("No import changes were made.", message)
+        self.assertNotIn("Synthetic database lock", message)
+
+        self.assert_rejected(
+            await self.callback(
+                "apply_verified",
+                confirmation.token,
+            )
+        )
+
+        self.writer.assert_called_once()
+
+    async def test_diagnostics_backup_directory_failure(self):
+        await self.upload(self.mixed_source())
+
+        confirmation = await self.prepare_confirmation()
+
+        before = self.snapshot()
+
+        with patch.object(
+            workflow,
+            "_prepare_backup_directory",
+            side_effect=PermissionError(
+                "Synthetic directory permission failure"
+            ),
+        ):
+            query = await self.callback(
+                "apply_verified",
+                confirmation.token,
+            )
+
+        self.writer.assert_not_called()
+
+        self.assertIsNone(self.current_session())
+        self.assertEqual(self.snapshot(), before)
+
+        message = query.edit_message_text.await_args.args[0]
+
+        self.assertIn("backup", message.casefold())
+        self.assertIn("No import changes were made.", message)
+
+        self.assertNotIn(
+            "Synthetic directory permission failure",
+            message,
+        )
+
+        self.assert_rejected(
+            await self.callback(
+                "apply_verified",
+                confirmation.token,
+            )
+        )
+
+        self.writer.assert_not_called()
+
+    async def test_diagnostics_uncertain_outcome_is_conservative(self):
+        await self.upload(self.mixed_source())
+
+        confirmation = await self.prepare_confirmation()
+
+        self.writer.side_effect = RuntimeError(
+            "Synthetic uncertain transaction outcome"
+        )
+
+        query = await self.callback(
+            "apply_verified",
+            confirmation.token,
+        )
+
+        self.writer.assert_called_once()
+
+        self.assertIsNone(self.current_session())
+
+        message = query.edit_message_text.await_args.args[0]
+
+        self.assertIn("could not verify", message.casefold())
+        self.assertNotIn("No import changes were made.", message)
+
+        self.assertNotIn(
+            "Synthetic uncertain transaction outcome",
+            message,
+        )
+
+        self.assert_rejected(
+            await self.callback(
+                "apply_verified",
+                confirmation.token,
+            )
+        )
+
+        self.writer.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

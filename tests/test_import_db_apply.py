@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import sqlite3
 import stat
 import tempfile
@@ -12,6 +14,7 @@ import imports.db_apply as db_apply
 
 from database import SCHEMA
 from imports.db_apply import (
+    ImportBackupError,
     ImportPreviewRejectedError,
     ImportPreviewStaleError,
     apply_database_import,
@@ -696,7 +699,7 @@ class ImportDatabaseApplyTests(
             database,
             backup,
         ):
-            original_backup(
+            identity = original_backup(
                 database,
                 backup,
             )
@@ -726,6 +729,8 @@ class ImportDatabaseApplyTests(
 
             finally:
                 writer.close()
+
+            return identity
 
         with patch.object(
             db_apply,
@@ -864,8 +869,8 @@ class ImportDatabaseApplyTests(
             state_count,
             0,
         )
-        self.assertTrue(
-            self.backup.is_file()
+        self.assertFalse(
+            self.backup.exists()
         )
 
     def test_review_required_preview_is_rejected_without_backup(self):
@@ -1126,6 +1131,10 @@ class ImportDatabaseApplyTests(
             1,
         )
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "Requires POSIX owner-only permission semantics.",
+    )
     def test_backup_permissions_are_owner_only(self):
         resolution = make_resolution(
             resolved_item(
@@ -1187,7 +1196,7 @@ class ImportDatabaseApplyTests(
         )
 
         with self.assertRaises(
-            FileExistsError
+            ImportBackupError
         ):
             apply_database_import(
                 approved,

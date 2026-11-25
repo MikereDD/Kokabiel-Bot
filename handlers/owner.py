@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
-import sys
 import time
 from datetime import datetime, timezone
 from html import escape
@@ -18,6 +16,7 @@ from telegram.ext import ContextTypes
 
 from config import ConfigError, load_settings
 from handlers.common import database, settings
+from handlers.import_tasks import import_task_manager
 from keyboards import owner_confirmation_keyboard
 from logging_setup import configure_logging
 from tmdb import TmdbClient
@@ -25,6 +24,7 @@ from version import __version__
 
 LOGGER = logging.getLogger(__name__)
 CONFIRMATION_TTL_SECONDS = 10 * 60
+RESTART_REQUESTED_KEY = "kokabiel_restart_requested"
 
 OWNER_HELP_TEXT = """<b>Kokabiel owner commands</b>
 
@@ -162,6 +162,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_owner(update, context):
         return
+
+    if import_task_manager(context.application).writer_count:
+        await update.effective_message.reply_text(
+            "A tracker import is being applied. "
+            "Try the leave command again when it finishes."
+        )
+        return
     chat = update.effective_chat
     if chat is None or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await update.effective_message.reply_text(
@@ -187,6 +194,13 @@ async def leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def leavechat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_owner(update, context, private_only=True):
+        return
+
+    if import_task_manager(context.application).writer_count:
+        await update.effective_message.reply_text(
+            "A tracker import is being applied. "
+            "Try the leave command again when it finishes."
+        )
         return
     if len(context.args) != 1:
         await update.effective_message.reply_text("Usage: /leavechat <chat_id>")
@@ -229,6 +243,23 @@ async def leavechat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def reload_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_owner(update, context, private_only=True):
+        return
+
+    manager = import_task_manager(context.application)
+
+    if manager.active_count:
+        await update.effective_message.reply_text(
+            "Configuration cannot be reloaded while an "
+            "import operation is active. Try again when "
+            "all imports have finished."
+        )
+        return
+
+    if not manager.accepting or not context.application.running:
+        await update.effective_message.reply_text(
+            "Kokabiel is shutting down. Configuration "
+            "cannot be reloaded."
+        )
         return
 
     old = settings(context)
@@ -325,10 +356,40 @@ async def owner_callback_router(
 
     decision, token = parts[1], parts[2]
     confirmations = context.user_data.get("kokabiel_owner_confirmations", {})
-    pending = confirmations.pop(token, None)
+    pending = confirmations.get(token)
     if pending is None:
         await query.answer("That confirmation expired or belongs to another owner.", show_alert=True)
         return
+
+    if pending["action"] in {"restart", "shutdown"}:
+        chat = update.effective_chat
+
+        if (
+            chat is None
+            or chat.type != ChatType.PRIVATE
+            or chat.id != pending["target_chat_id"]
+        ):
+            await query.answer(
+                "Confirm this owner action in its original private chat.",
+                show_alert=True,
+            )
+            return
+
+    if (
+        pending["action"] == "leave"
+        and decision == "ok"
+        and time.time() - pending["created_at"]
+        <= CONFIRMATION_TTL_SECONDS
+        and import_task_manager(context.application).writer_count
+    ):
+        await query.answer(
+            "A tracker import is being applied. "
+            "Try this confirmation again shortly.",
+            show_alert=True,
+        )
+        return
+
+    confirmations.pop(token, None)
 
     if time.time() - pending["created_at"] > CONFIRMATION_TTL_SECONDS:
         await query.answer("That confirmation expired.", show_alert=True)
@@ -345,16 +406,12 @@ async def owner_callback_router(
     action = pending["action"]
     if action == "leave":
         await _confirm_leave(update, context, pending)
-    elif action == "restart":
-        await query.answer("Restarting Kokabiel.")
-        await query.edit_message_text("Restarting Kokabiel…")
-        LOGGER.warning("Restart requested by owner %s", update.effective_user.id)
-        asyncio.create_task(_restart_after_delay())
-    elif action == "shutdown":
-        await query.answer("Shutting down Kokabiel.")
-        await query.edit_message_text("Shutting down Kokabiel…")
-        LOGGER.warning("Shutdown requested by owner %s", update.effective_user.id)
-        asyncio.create_task(_shutdown_after_delay())
+    elif action in {"restart", "shutdown"}:
+        await _request_graceful_stop(
+            update,
+            context,
+            restart_requested=(action == "restart"),
+        )
     else:
         await query.answer("That owner action is not available.", show_alert=True)
 
@@ -429,14 +486,73 @@ async def _confirm_leave(
     )
 
 
-async def _restart_after_delay() -> None:
-    await asyncio.sleep(1.0)
-    os.execv(sys.executable, [sys.executable, *sys.argv])
+async def _request_graceful_stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    restart_requested: bool,
+) -> None:
+    application = context.application
+    manager = import_task_manager(application)
+    query = update.callback_query
 
+    # The first accepted lifecycle request wins.
+    if not manager.accepting or not application.running:
+        await query.answer(
+            "Kokabiel is already shutting down.",
+            show_alert=True,
+        )
+        return
 
-async def _shutdown_after_delay() -> None:
-    await asyncio.sleep(1.0)
-    os.kill(os.getpid(), signal.SIGINT)
+    action = "restart" if restart_requested else "shutdown"
+
+    await query.answer(
+        "Graceful restart requested."
+        if restart_requested
+        else "Graceful shutdown requested."
+    )
+
+    await query.edit_message_text(
+        (
+            "Restart requested. "
+            if restart_requested
+            else "Shutdown requested. "
+        )
+        + "Active imports will finish before Kokabiel stops."
+    )
+
+    # Telegram delivery yielded control to the event loop.
+    # Shutdown may have started while it was in progress.
+    if not manager.accepting or not application.running:
+        LOGGER.info(
+            "Owner %s request superseded by application shutdown",
+            action,
+        )
+
+        await query.edit_message_text(
+            "Kokabiel is already shutting down. "
+            "No additional lifecycle action was accepted."
+        )
+        return
+
+    # Ordinary update dispatch remains sequential.
+    # No await occurs between closing admission,
+    # recording the requested action and requesting stop.
+    manager.close()
+
+    application.bot_data[
+        RESTART_REQUESTED_KEY
+    ] = restart_requested
+
+    LOGGER.warning(
+        "Graceful %s requested by owner %s",
+        action,
+        update.effective_user.id,
+    )
+
+    # PTB stops polling and waits for its tracked tasks.
+    # Never call os.execv from an active handler.
+    application.stop_running()
 
 
 def _format_uptime(started_at: object) -> str:

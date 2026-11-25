@@ -16,7 +16,6 @@ from telegram import (
 )
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
-from telegram.error import TelegramError
 
 from handlers.common import (
     allowed,
@@ -27,6 +26,8 @@ from handlers.common import (
 )
 from imports.db_apply import (
     ImportApplyError,
+    ImportBackupError,
+    ImportPreWriteError,
     ImportPreviewStaleError,
     apply_database_import,
 )
@@ -152,7 +153,7 @@ async def import_command(
     )
 
     pending = PendingImport(
-        token=token_hex(4),
+        token=token_hex(16),
         user_id=user_id,
         user_name=user_name,
         chat_id=chat.id,
@@ -396,10 +397,19 @@ async def receive_import_document(
             upload_path
         )
 
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not processing:
+            return
+
         processing = replace(
             processing,
             path=None,
         )
+
+        context.user_data[
+            IMPORT_SESSION_KEY
+        ] = processing
 
     except asyncio.CancelledError:
         _delete_path(upload_path)
@@ -419,6 +429,11 @@ async def receive_import_document(
         _delete_path(
             upload_path
         )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not processing:
+            return
 
         context.user_data[
             IMPORT_SESSION_KEY
@@ -445,6 +460,11 @@ async def receive_import_document(
         _delete_path(
             upload_path
         )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not processing:
+            return
 
         context.user_data[
             IMPORT_SESSION_KEY
@@ -476,6 +496,11 @@ async def receive_import_document(
             upload_path
         )
 
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not processing:
+            return
+
         context.user_data[
             IMPORT_SESSION_KEY
         ] = replace(
@@ -503,10 +528,6 @@ async def receive_import_document(
 
     # Keep the session non-actionable while delivering
     # its initial preview. The raw upload is already removed.
-    context.user_data[
-        IMPORT_SESSION_KEY
-    ] = processing
-
     try:
         await reply_personal_text(
             update,
@@ -532,10 +553,11 @@ async def receive_import_document(
 
         raise
 
-    except TelegramError:
+    except Exception as exc:
         LOGGER.warning(
-            "Import preview delivery failed for user %s",
+            "Import preview delivery failed for user %s (%s)",
             pending.user_id,
+            type(exc).__name__,
         )
 
         if context.user_data.get(
@@ -608,9 +630,10 @@ async def _edit_import_message_safely(
             **kwargs,
         )
 
-    except TelegramError:
+    except Exception as exc:
         LOGGER.warning(
-            "Import status message delivery failed"
+            "Import status message delivery failed (%s)",
+            type(exc).__name__,
         )
 
 
@@ -891,12 +914,9 @@ async def import_callback_router(
         )
         return
 
-    if (
-        pending.state == "verified_ready"
-        and preview.user_id != pending.user_id
-    ):
+    if preview.user_id != pending.user_id:
         await query.answer(
-            "That verified preview belongs to another user.",
+            "That import preview belongs to another user.",
             show_alert=True,
         )
         return
@@ -940,16 +960,19 @@ async def import_callback_router(
 
         raise
 
-    except TelegramError:
+    except Exception as exc:
         LOGGER.warning(
-            "Import acknowledgement failed for user %s",
+            "Import acknowledgement failed for user %s (%s)",
             pending.user_id,
+            type(exc).__name__,
         )
 
         if context.user_data.get(
             IMPORT_SESSION_KEY
-        ) is applying:
-            _discard_pending_import(context)
+        ) is not applying:
+            return
+
+        _discard_pending_import(context)
 
         await _edit_import_message_safely(
             query,
@@ -965,19 +988,31 @@ async def import_callback_router(
         return
 
     try:
-        current_settings = settings(
-            context
-        )
+        try:
+            current_settings = settings(
+                context
+            )
 
-        backup_path = _backup_path(
-            current_settings.database_path,
-            pending.user_id,
-            pending.token,
-        )
+        except Exception as exc:
+            raise ImportPreWriteError(
+                "Import settings could not be prepared."
+            ) from exc
 
-        _prepare_backup_directory(
-            backup_path.parent
-        )
+        try:
+            backup_path = _backup_path(
+                current_settings.database_path,
+                pending.user_id,
+                pending.token,
+            )
+
+            _prepare_backup_directory(
+                backup_path.parent
+            )
+
+        except Exception as exc:
+            raise ImportBackupError(
+                "Backup destination could not be prepared."
+            ) from exc
 
         result = await _run_import_worker(
             apply_database_import,
@@ -1005,6 +1040,11 @@ async def import_callback_router(
         raise
 
     except ImportPreviewStaleError:
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not applying:
+            return
+
         _discard_pending_import(
             context
         )
@@ -1019,11 +1059,52 @@ async def import_callback_router(
         )
         return
 
+    except (ImportBackupError, ImportPreWriteError) as exc:
+        LOGGER.exception(
+            "Import failed before mutations for user %s (%s)",
+            pending.user_id,
+            type(exc).__name__,
+        )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not applying:
+            return
+
+        _discard_pending_import(context)
+
+        if isinstance(exc, ImportBackupError):
+            message = (
+                "Kokabiel could not prepare a verified "
+                "database backup. "
+                "No import changes were made. "
+                "Run /import again before retrying."
+            )
+
+        else:
+            message = (
+                "Kokabiel could not start the database import. "
+                "No import changes were made. "
+                "Run /import again before retrying."
+            )
+
+        await _edit_import_message_safely(
+            query,
+            message,
+        )
+
+        return
+
     except ImportApplyError:
         LOGGER.exception(
             "Transactional import failed for user %s",
             pending.user_id,
         )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not applying:
+            return
 
         _discard_pending_import(
             context
@@ -1044,6 +1125,11 @@ async def import_callback_router(
             pending.user_id,
         )
 
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not applying:
+            return
+
         _discard_pending_import(
             context
         )
@@ -1055,6 +1141,11 @@ async def import_callback_router(
                 "normally. Run /import again before retrying."
             )
         )
+        return
+
+    if context.user_data.get(
+        IMPORT_SESSION_KEY
+    ) is not applying:
         return
 
     _discard_pending_import(
@@ -1075,8 +1166,8 @@ def format_import_result(
 ) -> str:
     if result.already_applied:
         return (
-            "✅ <b>Import already applied</b>\n\n"
-            "This approved preview had already been written. "
+            "✅ <b>Import already up to date</b>\n\n"
+            "Your current records already satisfy this approved preview. "
             "No duplicate changes were added."
         )
 

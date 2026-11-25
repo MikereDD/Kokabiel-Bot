@@ -55,3 +55,5 @@ class NormalizedImportRecord:
     rated_at: str | None = None
 
     source_file: str | None = None
+
+    episode_mapping_unverified: bool = False

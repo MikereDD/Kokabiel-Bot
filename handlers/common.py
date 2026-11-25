@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 
 from telegram import ReplyParameters, Update
 from telegram.constants import ChatType
@@ -187,9 +188,58 @@ async def delete_personal_message(
     )
 
 
+async def _record_activity(
+    db,
+    *,
+    chat_id: int,
+    chat_type: str,
+    title: str,
+    username: str | None,
+    user_id: int | None,
+    user_name: str | None,
+) -> None:
+    try:
+        await db.record_chat(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            title=title,
+            username=username,
+        )
+
+        if user_id is not None:
+            await db.record_user_chat(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=user_name or str(user_id),
+            )
+
+    except Exception:
+        LOGGER.exception(
+            "Could not record chat/user activity for chat %s",
+            chat_id,
+        )
+
+
+async def _reply_import_busy(update: Update) -> None:
+    message = (
+        "An import is being applied. "
+        "Please try this action again shortly."
+    )
+
+    if update.callback_query:
+        await update.callback_query.answer(
+            message,
+            show_alert=True,
+        )
+    elif update.effective_message:
+        await update.effective_message.reply_text(message)
+
+
 async def allowed(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    *,
+    defer_activity: bool = False,
 ) -> bool:
     chat = update.effective_chat
     user = update.effective_user
@@ -210,24 +260,59 @@ async def allowed(
     )
 
     if owner_private_chat or allowed_group_chat:
-        try:
-            await database(context).record_chat(
-                chat_id=chat.id,
-                chat_type=chat.type,
-                title=_chat_title(update),
-                username=chat.username,
-            )
-            if allowed_group_chat and user is not None:
-                await database(context).record_user_chat(
-                    chat_id=chat.id,
-                    user_id=user.id,
-                    user_name=user.full_name or user.username or str(user.id),
-                )
-        except Exception:
-            LOGGER.exception(
-                "Could not record chat/user activity for chat %s",
-                chat.id,
-            )
+        # Import lazily to avoid the common/import-task
+        # module dependency cycle during startup.
+        from handlers.import_tasks import (
+            IMPORT_TASK_MANAGER_KEY,
+        )
+
+        manager = context.application.bot_data.get(
+            IMPORT_TASK_MANAGER_KEY
+        )
+
+        blocked_by_writer = (
+            manager is not None
+            and manager.writer_count
+            and not manager.is_current_writer()
+        )
+
+        if blocked_by_writer and not defer_activity:
+            await _reply_import_busy(update)
+            return False
+
+        group_user = (
+            user if allowed_group_chat else None
+        )
+
+        operation = partial(
+            _record_activity,
+            database(context),
+            chat_id=chat.id,
+            chat_type=chat.type,
+            title=_chat_title(update),
+            username=chat.username,
+            user_id=(
+                group_user.id
+                if group_user is not None
+                else None
+            ),
+            user_name=(
+                group_user.full_name
+                or group_user.username
+                or str(group_user.id)
+                if group_user is not None
+                else None
+            ),
+        )
+
+        if blocked_by_writer:
+            if not manager.defer_activity(operation):
+                await _reply_import_busy(update)
+                return False
+
+            return True
+
+        await operation()
         return True
 
     if update.callback_query:

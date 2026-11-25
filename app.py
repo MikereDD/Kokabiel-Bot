@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from datetime import datetime, timezone
 
 import aiohttp
@@ -37,7 +39,16 @@ from handlers.imports import (
     import_command,
     receive_import_document,
 )
+from handlers.import_tasks import (
+    IMPORT_TASK_MANAGER_KEY,
+    ImportTaskManager,
+    dispatch_callback,
+    dispatch_import_command,
+    dispatch_import_document,
+    import_task_manager,
+)
 from handlers.owner import (
+    RESTART_REQUESTED_KEY,
     adminhelp,
     groups,
     leave,
@@ -114,6 +125,34 @@ async def post_init(application: Application) -> None:
     )
 
 
+async def post_stop(application: Application) -> None:
+    await import_task_manager(application).drain()
+
+
+async def _dispatch_import_command(update, context) -> None:
+    await dispatch_import_command(
+        update,
+        context,
+        import_command,
+    )
+
+
+async def _dispatch_import_document(update, context) -> None:
+    await dispatch_import_document(
+        update,
+        context,
+        receive_import_document,
+    )
+
+
+async def _dispatch_callback(update, context) -> None:
+    await dispatch_callback(
+        update,
+        context,
+        callback_router,
+    )
+
+
 async def post_shutdown(application: Application) -> None:
     session = application.bot_data.get("http_session")
     if session and not session.closed:
@@ -129,6 +168,7 @@ def build_application() -> Application:
         Application.builder()
         .token(settings.bot_token)
         .post_init(post_init)
+        .post_stop(post_stop)
         .post_shutdown(post_shutdown)
     )
     if settings.local_bot_api_url:
@@ -137,6 +177,10 @@ def build_application() -> Application:
         builder = builder.base_file_url(settings.local_bot_api_file_url)
 
     application = builder.build()
+    application.bot_data[
+        IMPORT_TASK_MANAGER_KEY
+    ] = ImportTaskManager()
+
     application.bot_data["settings"] = settings
     application.bot_data["database"] = Database(settings.database_path)
 
@@ -154,13 +198,13 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("suggestions", suggestions))
     application.add_handler(CommandHandler("mysuggestions", mysuggestions))
     application.add_handler(CommandHandler("random", random_pick))
-    application.add_handler(CommandHandler("import", import_command))
+    application.add_handler(CommandHandler("import", _dispatch_import_command))
 
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
             & filters.Document.ALL,
-            receive_import_document,
+            _dispatch_import_document,
         )
     )
 
@@ -174,7 +218,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("restart", restart))
     application.add_handler(CommandHandler("shutdown", shutdown))
 
-    application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_handler(CallbackQueryHandler(_dispatch_callback))
     application.add_error_handler(error_handler)
     return application
 
@@ -189,6 +233,16 @@ def main() -> None:
         allowed_updates=["message", "callback_query"],
         drop_pending_updates=False,
     )
+
+    # A successful return occurs after framework shutdown
+    # and the configured post_shutdown resource cleanup.
+    if application.bot_data.get(RESTART_REQUESTED_KEY, False):
+        LOGGER.info("Graceful shutdown complete; restarting Kokabiel")
+
+        os.execv(
+            sys.executable,
+            [sys.executable, *sys.argv],
+        )
 
 
 if __name__ == "__main__":

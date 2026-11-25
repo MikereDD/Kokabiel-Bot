@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
 
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
 from imports.db_preview import (
+    ExistingUserSnapshot,
     ImportDatabasePreview,
     ImportDbPreviewItem,
     build_database_preview,
     snapshot_from_connection,
 )
 from imports.resolve import ResolutionPreview
+
+
+BACKUP_DEADLINE_SECONDS = 30.0
+BACKUP_BUSY_TIMEOUT_SECONDS = 0.25
+BACKUP_RETRY_SECONDS = 0.05
+BACKUP_STEP_PAGES = 128
 
 
 class ImportApplyError(RuntimeError):
@@ -30,13 +40,17 @@ class ImportBackupError(ImportApplyError):
     """A verified pre-import database backup could not be created."""
 
 
+class ImportPreWriteError(ImportApplyError):
+    """Import failed before database mutations were attempted."""
+
+
 class ImportVerificationError(ImportApplyError):
     """The applied transaction did not produce the expected state."""
 
 
 @dataclass(frozen=True, slots=True)
 class ImportApplyResult:
-    backup_path: Path
+    backup_path: Path | None
     media_added: int
     states_added: int
     states_updated: int
@@ -71,13 +85,16 @@ def apply_database_import(
         database_path
     ).resolve()
 
-    backup = Path(
-        backup_path
-    ).resolve()
+    requested_backup = Path(backup_path)
+
+    backup = (
+        requested_backup.parent.resolve()
+        / requested_backup.name
+    )
 
     if not database.is_file():
-        raise FileNotFoundError(
-            f"Kokabiel database does not exist: {database}"
+        raise ImportPreWriteError(
+            "Kokabiel database does not exist."
         )
 
     if not user_name.strip():
@@ -99,67 +116,28 @@ def apply_database_import(
         approved
     )
 
-    connection = sqlite3.connect(
-        database,
-        timeout=10,
-        isolation_level=None,
-    )
-
-    connection.execute(
-        "PRAGMA foreign_keys = ON"
-    )
-
+    connection = None
+    backup_identity = None
+    mutation_started = False
     committed = False
 
     try:
-        version_before_backup = int(
-            connection.execute(
-                "PRAGMA data_version"
-            ).fetchone()[0]
+        connection = sqlite3.connect(
+            f"{database.as_uri()}?mode=rw",
+            uri=True,
+            timeout=10,
+            isolation_level=None,
         )
 
-        _create_verified_backup(
-            database,
-            backup,
-        )
+        connection.execute("PRAGMA foreign_keys = ON")
 
-        connection.execute(
-            "BEGIN IMMEDIATE"
-        )
+        # Preflight under a write reservation. A database
+        # that is already locked fails before backup creation.
+        connection.execute("BEGIN IMMEDIATE")
 
-        version_after_lock = int(
-            connection.execute(
-                "PRAGMA data_version"
-            ).fetchone()[0]
-        )
-
-        if (
-            version_after_lock
-            != version_before_backup
-        ):
-            connection.rollback()
-
-            try:
-                backup.unlink(
-                    missing_ok=True
-                )
-            except OSError as exc:
-                raise ImportBackupError(
-                    "Database changed during backup and "
-                    "the stale backup could not be removed."
-                ) from exc
-
-            raise ImportPreviewStaleError(
-                "Database changed while the pre-import "
-                "backup was being created. Retry with a "
-                "fresh preview."
-            )
-
-        current_snapshot = (
-            snapshot_from_connection(
-                connection,
-                approved.user_id,
-            )
+        current_snapshot = snapshot_from_connection(
+            connection,
+            approved.user_id,
         )
 
         current = build_database_preview(
@@ -167,17 +145,30 @@ def apply_database_import(
             current_snapshot,
         )
 
-        if current == approved:
-            pass
+        if current != approved:
+            if not _preview_already_applied(
+                approved,
+                current,
+                current_snapshot,
+            ):
+                raise ImportPreviewStaleError(
+                    "Database state no longer matches "
+                    "the approved import preview."
+                )
 
-        elif _preview_already_applied(
-            approved,
-            current,
-        ):
+            no_changes = True
+
+        else:
+            no_changes = not any(
+                item.has_changes
+                for item in approved.items
+            )
+
+        if no_changes:
             connection.rollback()
 
             return ImportApplyResult(
-                backup_path=backup,
+                backup_path=None,
                 media_added=0,
                 states_added=0,
                 states_updated=0,
@@ -186,10 +177,63 @@ def apply_database_import(
                 already_applied=True,
             )
 
-        else:
+        version_before_backup = int(
+            connection.execute(
+                "PRAGMA data_version"
+            ).fetchone()[0]
+        )
+
+        # The backup uses a separate read-only connection.
+        # Release the reservation before copying the database.
+        connection.rollback()
+
+        backup_identity = _create_verified_backup(
+            database,
+            backup,
+        )
+
+        _assert_backup_identity(
+            backup,
+            backup_identity,
+        )
+
+        # Reacquire the reservation and ensure no other
+        # connection changed the database during the gap.
+        connection.execute("BEGIN IMMEDIATE")
+
+        version_after_lock = int(
+            connection.execute(
+                "PRAGMA data_version"
+            ).fetchone()[0]
+        )
+
+        if version_after_lock != version_before_backup:
             raise ImportPreviewStaleError(
-                "Database state no longer matches the approved import preview."
+                "Database changed while the pre-import "
+                "backup was being created. Retry with a "
+                "fresh preview."
             )
+
+        current_snapshot = snapshot_from_connection(
+            connection,
+            approved.user_id,
+        )
+
+        current = build_database_preview(
+            resolution,
+            current_snapshot,
+        )
+
+        if current != approved:
+            raise ImportPreviewStaleError(
+                "Database state no longer matches "
+                "the approved import preview."
+            )
+
+        expected_state = _expected_final_state(
+            current_snapshot,
+            approved,
+        )
 
         counts = {
             "media_added": 0,
@@ -198,6 +242,13 @@ def apply_database_import(
             "episodes_added": 0,
             "ratings_added": 0,
         }
+
+        _assert_backup_identity(
+            backup,
+            backup_identity,
+        )
+
+        mutation_started = True
 
         for item in approved.items:
             _apply_item(
@@ -249,9 +300,14 @@ def apply_database_import(
             )
         )
 
-        if not _preview_already_applied(
-            approved,
-            applied_preview,
+        if (
+            _snapshot_state(applied_snapshot)
+            != expected_state
+            or not _preview_already_applied(
+                approved,
+                applied_preview,
+                applied_snapshot,
+            )
         ):
             raise ImportVerificationError(
                 "Transaction result does not match the approved preview."
@@ -260,13 +316,31 @@ def apply_database_import(
         connection.commit()
         committed = True
 
-    except Exception:
-        if connection.in_transaction:
+    except Exception as exc:
+        if (
+            connection is not None
+            and connection.in_transaction
+        ):
             connection.rollback()
+
+        if not mutation_started:
+            if backup_identity is not None:
+                _remove_owned_backup(
+                    backup,
+                    backup_identity,
+                )
+
+            if not isinstance(exc, ImportApplyError):
+                raise ImportPreWriteError(
+                    "Import failed before database "
+                    "mutations were attempted."
+                ) from exc
+
         raise
 
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
     if not committed:
         raise ImportVerificationError(
@@ -294,94 +368,207 @@ def apply_database_import(
     )
 
 
+def _assert_backup_identity(
+    backup: Path,
+    identity: tuple[int, int],
+) -> None:
+    """Require the originally reserved backup to remain present."""
+    try:
+        current = backup.lstat()
+
+    except OSError as exc:
+        raise ImportBackupError(
+            "Verified backup is no longer available."
+        ) from exc
+
+    if (current.st_dev, current.st_ino) != identity:
+        raise ImportBackupError(
+            "Verified backup identity changed."
+        )
+
+
+def _remove_owned_backup(
+    backup: Path,
+    identity: tuple[int, int],
+) -> None:
+    """Remove only the backup reserved by this operation."""
+    try:
+        current = backup.lstat()
+
+    except FileNotFoundError:
+        return
+
+    except OSError as exc:
+        raise ImportBackupError(
+            "Could not inspect unused backup."
+        ) from exc
+
+    if (current.st_dev, current.st_ino) != identity:
+        raise ImportBackupError(
+            "Backup identity changed; refusing removal."
+        )
+
+    try:
+        backup.unlink()
+
+    except OSError as exc:
+        raise ImportBackupError(
+            "Could not remove unused backup."
+        ) from exc
+
+
 def _create_verified_backup(
     database: Path,
     backup: Path,
-) -> None:
-    if backup.exists():
-        raise FileExistsError(
-            f"Backup already exists: {backup}"
-        )
+) -> tuple[int, int]:
+    identity = None
 
-    backup.parent.mkdir(
-        parents=True,
-        exist_ok=True,
+    deadline = (
+        time.monotonic()
+        + BACKUP_DEADLINE_SECONDS
     )
 
-    source_uri = (
-        f"{database.as_uri()}?mode=ro"
-    )
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise ImportBackupError(
+                "Database backup execution deadline exceeded."
+            )
 
-    source = None
-    destination = None
+    def backup_progress(
+        status: int,
+        remaining: int,
+        total: int,
+    ) -> None:
+        # SQLite calls this after each backup step,
+        # including busy and locked retry steps.
+        check_deadline()
+
+    def verification_progress() -> int:
+        # Interrupt lengthy integrity verification
+        # cooperatively through SQLite's progress handler.
+        return int(time.monotonic() >= deadline)
 
     try:
-        source = sqlite3.connect(
-            source_uri,
-            uri=True,
-            timeout=10,
+        backup.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-        destination = sqlite3.connect(
+        # O_EXCL rejects existing files and symlinks,
+        # including dangling symlinks.
+        fd = os.open(
             backup,
-            timeout=10,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
         )
-
-        source.backup(
-            destination
-        )
-
-        row = destination.execute(
-            "PRAGMA integrity_check"
-        ).fetchone()
-
-        if (
-            row is None
-            or str(row[0]).casefold()
-            != "ok"
-        ):
-            raise ImportBackupError(
-                "Backup integrity_check failed."
-            )
-
-        destination.commit()
-
-        # Backups contain the same personal data as the live database.
-        # Do not leave them readable by other local users.
-        backup.chmod(0o600)
-
-    except Exception as exc:
-        if destination is not None:
-            destination.close()
-            destination = None
-
-        if source is not None:
-            source.close()
-            source = None
 
         try:
-            backup.unlink(
-                missing_ok=True
-            )
-        except OSError:
-            pass
+            reserved = os.fstat(fd)
 
-        if isinstance(
-            exc,
-            ImportBackupError,
-        ):
+            identity = (
+                reserved.st_dev,
+                reserved.st_ino,
+            )
+
+        finally:
+            os.close(fd)
+
+        # Ensure an unusually restrictive umask does
+        # not prevent SQLite from opening the reservation.
+        backup.chmod(0o600)
+
+        source_uri = f"{database.as_uri()}?mode=ro"
+
+        with closing(
+            sqlite3.connect(
+                source_uri,
+                uri=True,
+                timeout=BACKUP_BUSY_TIMEOUT_SECONDS,
+            )
+        ) as source:
+            with closing(
+                sqlite3.connect(
+                    backup,
+                    timeout=BACKUP_BUSY_TIMEOUT_SECONDS,
+                )
+            ) as destination:
+
+                check_deadline()
+
+                source.backup(
+                    destination,
+                    pages=BACKUP_STEP_PAGES,
+                    progress=backup_progress,
+                    sleep=BACKUP_RETRY_SECONDS,
+                )
+
+                check_deadline()
+
+                destination.set_progress_handler(
+                    verification_progress,
+                    1000,
+                )
+
+                try:
+                    row = destination.execute(
+                        "PRAGMA integrity_check"
+                    ).fetchone()
+
+                except sqlite3.OperationalError:
+                    # Distinguish deadline interruption
+                    # from unrelated SQLite failures.
+                    check_deadline()
+                    raise
+
+                finally:
+                    destination.set_progress_handler(
+                        None,
+                        0,
+                    )
+
+                check_deadline()
+
+                if (
+                    row is None
+                    or str(row[0]).casefold() != "ok"
+                ):
+                    raise ImportBackupError(
+                        "Backup integrity_check failed."
+                    )
+
+                destination.commit()
+
+                check_deadline()
+
+        _assert_backup_identity(
+            backup,
+            identity,
+        )
+
+        check_deadline()
+
+        return identity
+
+    except Exception as exc:
+        # Never remove a destination that we failed
+        # to reserve exclusively.
+        if identity is not None:
+            _remove_owned_backup(
+                backup,
+                identity,
+            )
+
+        if isinstance(exc, ImportBackupError):
             raise
 
+        if isinstance(exc, FileExistsError):
+            raise ImportBackupError(
+                "Backup destination already exists."
+            ) from exc
+
         raise ImportBackupError(
-            f"Could not create verified database backup: {exc}"
+            "Could not create verified database backup."
         ) from exc
-
-    finally:
-        if destination is not None:
-            destination.close()
-
-        if source is not None:
-            source.close()
 
 
 def _resolution_from_preview(
@@ -652,86 +839,236 @@ def _apply_item(
         )
 
 
+def _snapshot_state(
+    snapshot: ExistingUserSnapshot,
+) -> tuple:
+    """Project import-relevant persisted values.
+
+    Generated timestamps are intentionally excluded from this
+    projection. Personal-state row existence, rating values,
+    catalog identities and exact episode sets are retained.
+    """
+    return (
+        snapshot.user_id,
+        {
+            key: (
+                state.watchlist,
+                state.viewing_status,
+            )
+            for key, state in snapshot.states.items()
+        },
+        {
+            key: rating.rating
+            for key, rating in snapshot.ratings.items()
+        },
+        snapshot.episodes,
+        snapshot.media,
+    )
+
+
+def _expected_final_state(
+    snapshot: ExistingUserSnapshot,
+    approved: ImportDatabasePreview,
+) -> tuple:
+    """Fold approved actions over the locked starting snapshot.
+
+    Later approved state transitions supersede earlier
+    transitions for the same canonical identity.
+
+    This calculation does not execute SQL and does not use
+    the database writer's mutation implementation.
+    """
+    if snapshot.user_id != approved.user_id:
+        raise ImportVerificationError(
+            "Approved preview has an unexpected user identity."
+        )
+
+    _, states, ratings, episodes, media = _snapshot_state(
+        snapshot
+    )
+
+    episodes = {
+        key: set(values)
+        for key, values in episodes.items()
+    }
+
+    media = set(media)
+
+    for item in approved.items:
+        if item.needs_review:
+            raise ImportPreviewRejectedError(
+                "Review-required item reached verification."
+            )
+
+        if (
+            item.media_type is None
+            or item.tmdb_id is None
+        ):
+            if item.has_changes:
+                raise ImportVerificationError(
+                    "Approved action lacks a canonical identity."
+                )
+
+            continue
+
+        key = (
+            item.media_type,
+            item.tmdb_id,
+        )
+
+        if item.media_action == "add":
+            media.add(key)
+
+        if item.state_action in {"add", "update"}:
+            states[key] = (
+                item.after_watchlist,
+                item.after_status,
+            )
+
+        if item.rating_action == "add":
+            if item.proposed_rating is None:
+                raise ImportVerificationError(
+                    "Approved rating action lacks a rating."
+                )
+
+            ratings[key] = item.proposed_rating
+
+        elif item.rating_action == "review":
+            raise ImportPreviewRejectedError(
+                "Rating conflict reached verification."
+            )
+
+        if item.episode_additions:
+            episodes.setdefault(
+                item.tmdb_id,
+                set(),
+            ).update(
+                item.episode_additions
+            )
+
+    return (
+        snapshot.user_id,
+        states,
+        ratings,
+        {
+            key: frozenset(values)
+            for key, values in episodes.items()
+        },
+        frozenset(media),
+    )
+
+
 def _preview_already_applied(
     approved: ImportDatabasePreview,
     current: ImportDatabasePreview,
+    snapshot: ExistingUserSnapshot,
 ) -> bool:
+    """Recognize a safe replay using final canonical state.
+
+    Intermediate personal-state transitions are not required
+    to survive later approved transitions.
+
+    Every approved resolution must still agree with the
+    current preview, and re-planning must require no writes.
+    """
     if (
-        approved.source
-        != current.source
-        or approved.user_id
-        != current.user_id
-        or approved.raw_record_count
-        != current.raw_record_count
-        or len(approved.items)
-        != len(current.items)
+        approved.source != current.source
+        or approved.user_id != current.user_id
+        or approved.user_id != snapshot.user_id
+        or approved.raw_record_count != current.raw_record_count
+        or len(approved.items) != len(current.items)
     ):
         return False
 
-    for (
-        wanted,
-        now,
-    ) in zip(
+    final_states = {}
+
+    for wanted, now in zip(
         approved.items,
         current.items,
         strict=True,
     ):
         if (
-            wanted.resolution
-            != now.resolution
+            wanted.resolution != now.resolution
+            or wanted.needs_review
             or now.needs_review
-            or wanted.notices
-            != now.notices
+            or wanted.notices != now.notices
+            or wanted.media_type != now.media_type
+            or wanted.tmdb_id != now.tmdb_id
         ):
             return False
 
-        if now.media_action != "none":
+        if (
+            now.media_action != "none"
+            or now.state_action != "none"
+            or now.rating_action != "none"
+            or now.episode_additions
+        ):
             return False
+
+        if (
+            wanted.media_type is None
+            or wanted.tmdb_id is None
+        ):
+            if wanted.has_changes:
+                return False
+
+            continue
+
+        key = (
+            wanted.media_type,
+            wanted.tmdb_id,
+        )
+
+        if (
+            wanted.media_action == "add"
+            and key not in snapshot.media
+        ):
+            return False
+
+        final_states[key] = (
+            wanted.after_watchlist,
+            wanted.after_status,
+        )
 
         if wanted.state_action != "none":
-            if (
-                now.state_action
-                != "none"
-                or now.before_watchlist
-                != wanted.after_watchlist
-                or now.before_status
-                != wanted.after_status
-            ):
+            if key not in snapshot.states:
                 return False
 
-        else:
-            if (
-                now.state_action
-                != "none"
-                or now.before_watchlist
-                != wanted.before_watchlist
-                or now.before_status
-                != wanted.before_status
-            ):
-                return False
+        if wanted.episode_additions:
+            existing_episodes = snapshot.episodes.get(
+                wanted.tmdb_id,
+                frozenset(),
+            )
 
-        if now.episode_additions:
-            return False
+            if not set(
+                wanted.episode_additions
+            ).issubset(existing_episodes):
+                return False
 
         if wanted.rating_action == "add":
             if (
-                now.rating_action
-                != "none"
-                or now.existing_rating
-                != wanted.proposed_rating
+                wanted.proposed_rating is None
+                or now.existing_rating != wanted.proposed_rating
             ):
                 return False
 
         elif wanted.rating_action == "none":
-            if (
-                now.rating_action
-                != "none"
-                or now.existing_rating
-                != wanted.existing_rating
-            ):
+            if now.existing_rating != wanted.existing_rating:
                 return False
 
         else:
+            return False
+
+    for key, expected in final_states.items():
+        state = snapshot.states.get(key)
+
+        actual = (
+            (state.watchlist, state.viewing_status)
+            if state is not None
+            else (False, "none")
+        )
+
+        if actual != expected:
             return False
 
     return True

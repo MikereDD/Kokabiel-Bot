@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import tempfile
 import unittest
 
@@ -29,6 +31,7 @@ def preview(
     *,
     review_count=0,
     has_changes=True,
+    user_id=123,
 ):
     status = (
         "needs_review"
@@ -45,6 +48,7 @@ def preview(
 
     return SimpleNamespace(
         source="trakt",
+        user_id=user_id,
         raw_record_count=12,
         items=(item,),
         media_add_count=1 if has_changes else 0,
@@ -120,6 +124,10 @@ class ImportTelegramWorkflowTests(
                 str(path),
             )
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "Requires POSIX owner-only permission semantics.",
+    )
     def test_quarantine_directory_is_owner_only(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = (
@@ -610,11 +618,16 @@ class ImportTelegramApprovalTests(
                 "backup_path"
             ]
 
-            self.assertEqual(
-                backup.parent.stat().st_mode
-                & 0o777,
-                0o700,
+            self.assertTrue(
+                backup.parent.is_dir()
             )
+
+            if os.name == "posix":
+                self.assertEqual(
+                    backup.parent.stat().st_mode
+                    & 0o777,
+                    0o700,
+                )
 
             self.assertNotIn(
                 IMPORT_SESSION_KEY,

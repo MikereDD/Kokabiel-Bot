@@ -65,7 +65,7 @@ It does not inspect ordinary group conversation.
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await allowed(update, context):
+    if not await allowed(update, context, defer_activity=True):
         return
     await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
@@ -75,7 +75,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await allowed(update, context):
+    if not await allowed(update, context, defer_activity=True):
         return
 
     credits_card = Path(__file__).resolve().parent.parent / "assets" / "kokabiel-credits.png"
@@ -110,7 +110,7 @@ async def _search(
     command_name: str,
     search_function: SearchFunction,
 ) -> None:
-    if not await allowed(update, context):
+    if not await allowed(update, context, defer_activity=True):
         return
     query = " ".join(context.args).strip()
     if not query:

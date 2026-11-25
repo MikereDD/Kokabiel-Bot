@@ -4,6 +4,7 @@ import asyncio
 import random
 import sqlite3
 from collections.abc import Callable, Iterable
+from contextlib import closing
 from pathlib import Path
 from typing import TypeVar
 
@@ -174,7 +175,7 @@ class Database:
         await asyncio.to_thread(self._initialize_sync)
 
     def _initialize_sync(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.executescript(SCHEMA)
             self._ensure_media_columns(connection)
             self._migrate_legacy_group_state(connection)
@@ -185,16 +186,20 @@ class Database:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     async def _write(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         async with self._write_lock:
             return await asyncio.to_thread(self._run_write_sync, operation)
 
     def _run_write_sync(self, operation: Callable[[sqlite3.Connection], T]) -> T:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             result = operation(connection)
             connection.commit()
             return result
@@ -203,7 +208,7 @@ class Database:
         return await asyncio.to_thread(self._run_read_sync, operation)
 
     def _run_read_sync(self, operation: Callable[[sqlite3.Connection], T]) -> T:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             return operation(connection)
 
     # ------------------------------------------------------------------

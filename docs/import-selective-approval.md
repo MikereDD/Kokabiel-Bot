@@ -2,11 +2,15 @@
 
 ## Status
 
-Milestone M3 — implementation and automated validation complete.
+Milestones M1-M4 — implementation and development validation.
 
-Feature branch: `feat/import-selective-approval`
+Audit remediation branch: `fix/import-audit-remediation`
 
-Baseline commit: `8d18b6e`
+Remediation baseline: `740d78b9141abc80bfb0aab1a1e1c67db4882d40`
+
+Supported runtime: ARAKIEL, Arch Linux ARM.
+
+Final independent review and live acceptance remain outstanding.
 
 Validation environment: ARAKIEL, Python 3.14, disposable SQLite
 databases and simulated Telegram interactions.
@@ -29,9 +33,21 @@ validation, transactional safeguards or existing privacy requirements.
 Supported native CSV, JSON and ZIP formats remain subject to the
 existing source-specific detection and parsing rules.
 
+### Simkl anime episode history
+
+Native anime episode coordinates are retained as source data,
+but are not assumed to match TMDB episode coordinates.
+
+Unverified episode mappings require review. Selective approval
+excludes the associated dependent group while retaining
+unrelated eligible records.
+
+Anime movies and anime series without explicit episode history
+retain their normal import behavior.
+
 ## User workflow
 
-1. Run `/import` in a private chat with Kokabiel.
+1. Run `/import` in an authorized private chat with Kokabiel.
 2. Upload a supported native tracker export.
 3. Review the initial import preview.
 4. If every record is verified, use the ordinary Import action.
@@ -122,9 +138,18 @@ Selective imports use the existing transactional database writer.
 - Existing conflicting ratings are protected.
 - Episode history remains union-only.
 - Excluded records and linked dependencies are not applied.
-- A pre-import database backup is created and verified.
-- Transaction failures roll back database changes.
+- Stale approvals and semantic no-ops do not create new backups.
+- Mutating imports require a verified pre-import database backup.
+- Backup destinations are reserved exclusively.
+- Backup creation has a cooperative execution deadline.
+- Final logical import state is checked before transaction commit.
+- Transaction failures roll back import changes.
+- Backups are retained when required for recovery.
 - Reapplication is protected against duplicate changes.
+- A semantic no-op does not prove that a previous import occurred.
+
+Pre-import backups contain the complete SQLite database,
+including other users' data. They must remain private.
 
 No database schema changes or new dependencies are required.
 
@@ -165,16 +190,42 @@ the applying session is released.
 The resulting transaction outcome is preserved. Cancellation does
 not trigger an automatic transaction retry.
 
+## Responsiveness and shutdown
+
+Ordinary Telegram update dispatch remains sequential.
+
+Import processing uses supervised background tasks, with a
+maximum of two active imports and one import writer.
+
+Informational commands can remain responsive during an import
+transaction. Their activity records may be deferred in a
+bounded queue of up to 32 entries.
+
+Consistency-dependent actions can temporarily return a busy
+response while a writer is active.
+
+Accepted deferred activity is processed before the writer
+reservation is released. Storage failures remain best-effort.
+
+Configuration reload is restricted during active imports.
+Graceful restart and shutdown wait for supervised work to
+finish before releasing application resources.
+
 ## Validation
 
 Final automated validation on ARAKIEL:
 
 | Suite | Passed |
 | --- | ---: |
-| Cancellation safety | 5/5 |
-| Complete selective upload integration | 22/22 |
-| Combined targeted regression | 93/93 |
-| Full repository regression | 234/234 |
+| M4.5 lifecycle regression | 39/39 |
+| M4.6 targeted regression | 49/49 |
+| M4.6 full repository regression | 320/320 |
+
+Prior independent harness revalidation included 2,500 randomized
+iterations, 231 successful SQLite applications, and 231
+successful idempotent replays.
+
+This revalidation is not a fresh independent audit.
 
 The smaller suites are included in the full repository suite and
 must not be added to the full test count.
@@ -197,8 +248,14 @@ Additional validation:
   been validated as part of this milestone.
 - Handler-level integration tests use simulated Telegram transport.
 - Forced process termination and power-loss recovery were not tested.
-- Complete application shutdown behavior was inspected but has not
-  been exercised during an active import.
+- Graceful shutdown during real disposable SQLite transactions
+  passed automated application lifecycle integration tests.
+- Actual production process replacement and OS signal delivery
+  remain untested.
+- Deferred activity has a bounded queue size, but no separate
+  aggregate execution deadline.
+- Historical backup retention requires an approved policy.
+- Windows runtime compatibility is not supported.
 - Quarantine deletion remains best-effort on filesystem errors.
 - Selective approval does not provide interactive correction of
   excluded records.

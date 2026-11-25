@@ -7,7 +7,7 @@
 [![Version](https://img.shields.io/badge/version-0.2.0--dev-gold)](https://github.com/MikereDD/Kokabiel-Bot/releases)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Telegram-26A5E4)
-![Library](https://img.shields.io/badge/python--telegram--bot-21.x-blue)
+![Library](https://img.shields.io/badge/python--telegram--bot-22.x-blue)
 ![Database](https://img.shields.io/badge/database-SQLite-07405E)
 ![API](https://img.shields.io/badge/data-TMDB-01B4E4)
 ![License](https://img.shields.io/badge/license-Typezer%E2%88%85%20All%20Rights%20Reserved-darkred)
@@ -46,6 +46,9 @@ production, and interacts with Kokabiel through explicit controls.
 - Owner-only administration includes runtime status, configuration reload,
   restart/shutdown controls, group inspection, and leave-group actions.
 - SQLite keeps the deployment lightweight and self-contained.
+- Native tracker imports from IMDb, Letterboxd, Trakt, and Simkl.
+- Reviewable import previews and selective approval of verified records.
+- Transactional imports with verified pre-import database backups.
 
 ## Commands
 
@@ -54,11 +57,30 @@ production, and interacts with Kokabiel through explicit controls.
 | Discovery | `/movie <title>` · `/tv <title>` · `/documentary <title>` · `/search <title>` · `/random` |
 | Personal | `/mywatchlist` · `/watched` · `/myprogress` · `/mysuggestions` |
 | Group | `/watchlist` · `/suggestions` |
+| Imports | `/import` (authorized private chat) |
 | General | `/about` · `/help` |
 | Owner | `/adminhelp` · `/whoami` · `/groups` · `/leave` · `/leavechat <chat_id>` · `/status` · `/reload` · `/restart` · `/shutdown` |
 
 Destructive or disruptive owner actions require confirmation. Sensitive runtime
 commands are restricted to Kokabiel's private chat.
+
+## Tracker imports
+
+Use `/import` in an authorized private chat with Kokabiel,
+then upload a supported native tracker export.
+
+Kokabiel prepares a preview before applying imported personal
+watchlists, watched states, ratings, and supported episode history.
+
+When records require review, eligible records can be prepared
+and approved separately. Related records with unresolved
+identities or conflicts are conservatively excluded.
+
+Simkl anime episode mappings require review rather than
+assuming that source episode numbers match TMDB.
+
+See [Selective Tracker Import Approval](docs/import-selective-approval.md)
+for the workflow, safeguards, and limitations.
 
 ## Privacy model
 
@@ -76,6 +98,11 @@ Keep **Privacy Mode enabled** in BotFather:
 Kokabiel does not require Telegram administrator status for its normal feature
 set.
 
+## Supported runtime
+
+Kokabiel is deployed on ARAKIEL, a Raspberry Pi 5 running
+Arch Linux ARM. Windows runtime support is outside project scope.
+
 ## Requirements
 
 - Python 3.11 or newer recommended
@@ -92,6 +119,8 @@ Kokabiel/
 ├── assets/                  # Kokabiel and required attribution artwork
 ├── docs/                    # third-party attribution and project documentation
 ├── handlers/                # Telegram command/callback/owner handlers
+├── imports/                 # tracker intake, resolution, and transactions
+├── tests/                   # automated regression tests
 ├── app.py                   # application construction and handler registration
 ├── config.py                # external runtime configuration loader
 ├── database.py              # SQLite schema, migrations, and persistence
@@ -187,6 +216,7 @@ From the repository root:
 
 ```bash
 python -m compileall -q .
+python -m unittest discover -s tests -v
 ```
 
 For behavior that depends on Telegram, TMDB, and real group state, use the live

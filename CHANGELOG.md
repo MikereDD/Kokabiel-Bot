@@ -4,6 +4,13 @@
 
 ### Added
 
+- Native IMDb, Letterboxd, Trakt, and Simkl tracker imports.
+- Private import previews with explicit approval.
+- Selective approval of verified records and dependency exclusion.
+- Conservative TMDB identity resolution with per-import caching.
+- Transactional database application and verified pre-import backups.
+- Supervised background import execution with bounded concurrency.
+
 - Repository-level source license notice, security policy, and third-party attribution documentation for public GitHub publication.
 - Explicit JustWatch attribution when streaming-provider availability is displayed.
 - Media-aware classification for films, documentary films, TV series, limited series, documentary series, and documentary limited series.
@@ -33,6 +40,20 @@
 - Ongoing series automatically return from Caught up to Watching when new released episodes appear.
 - Owner callbacks bypass the normal group allowlist while still requiring an owner ID.
 - Logging reconfiguration closes replaced handlers cleanly.
+
+### Fixed
+
+- Order-dependent verification of imported series and episode history.
+- Import session recovery following failed Telegram message delivery.
+- Duplicate confirmation and stale-session authorization safeguards.
+- Unnecessary backup creation for stale previews and semantic no-ops.
+- Backup collision handling and cooperative backup deadlines.
+- SQLite connection cleanup.
+- Group command responsiveness during active imports.
+- Graceful owner restart and shutdown during import processing.
+- Unverified Simkl anime episode numbering now requires review.
+- Import no-op messages distinguish current database state from
+  proof of a previous transaction.
 
 ## 0.1 — 2026-07-28
 

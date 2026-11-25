@@ -389,7 +389,26 @@ def _merge_group(
         )
     )
 
+    episode_mapping_unverified = any(
+        record.episode_mapping_unverified
+        for record in records
+    )
+
+    if episode_mapping_unverified:
+        conflicts.append(
+            ImportConflict(
+                field="episode_mapping",
+                values=("unverified",),
+                message=(
+                    "Simkl anime episode numbering has not "
+                    "been verified against TMDB. Episode "
+                    "history requires review."
+                ),
+            )
+        )
+
     proposed = NormalizedImportRecord(
+        episode_mapping_unverified=episode_mapping_unverified,
         source=records[0].source,
         media_type=media_type,
         title=title,

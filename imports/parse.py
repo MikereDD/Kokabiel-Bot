@@ -703,6 +703,9 @@ def _simkl_json_item_records(
                 NormalizedImportRecord(
                     **common,
                     media_type="episode",
+                    episode_mapping_unverified=(
+                        collection == "anime"
+                    ),
                     season=season_number,
                     episode=episode_number,
                     watched=True,

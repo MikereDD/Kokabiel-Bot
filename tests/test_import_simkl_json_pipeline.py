@@ -231,5 +231,161 @@ class SimklJsonPipelineTests(
         )
 
 
+    async def test_unverified_anime_history_requires_review(self):
+        from copy import deepcopy
+        from imports.selective import build_selective_import_preview
+
+        payload = deepcopy(SIMKL_SERIES)
+        anime = deepcopy(payload["shows"][0])
+
+        anime["anime_type"] = "tv"
+        anime["show"]["title"] = "Example Anime"
+        anime["show"]["ids"] = {
+            "tmdb": "201",
+            "simkl": 102,
+            "imdb": "tt1000002",
+            "tvdb": "301",
+        }
+
+        # Neither a plausible episode number nor an absolute
+        # episode number establishes a verified TMDB mapping.
+        anime["seasons"][0]["episodes"][1]["number"] = 500
+
+        payload["anime"] = [anime]
+
+        class MixedTmdb(CountingTmdb):
+            async def lookup_result(self, media_type, tmdb_id):
+                if tmdb_id == 201:
+                    self.lookup_calls += 1
+                    return SearchResult(
+                        media_type="tv",
+                        tmdb_id=201,
+                        title="Example Anime",
+                        original_title="Example Anime",
+                        year="2020",
+                        overview="",
+                        poster_path=None,
+                    )
+
+                return await super().lookup_result(
+                    media_type,
+                    tmdb_id,
+                )
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "watchlists.json"
+            path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+            plan = analyze_import(str(path))
+
+        self.assertEqual(plan.raw_record_count, 6)
+
+        resolution = await resolve_import_plan(
+            plan,
+            MixedTmdb(),
+        )
+
+        selective = build_selective_import_preview(
+            resolution,
+            ExistingUserSnapshot(
+                user_id=1,
+                states={},
+                ratings={},
+                episodes={},
+                media=frozenset(),
+            ),
+        )
+
+        self.assertEqual(selective.full.review_count, 2)
+
+        anime_episodes = [
+            item
+            for item in selective.full.items
+            if (
+                item.resolution.plan_item.proposed.title
+                == "Example Anime"
+                and item.resolution.plan_item.proposed.media_type
+                == "episode"
+            )
+        ]
+
+        self.assertEqual(len(anime_episodes), 2)
+
+        self.assertEqual(
+            {
+                item.resolution.plan_item.proposed.episode
+                for item in anime_episodes
+            },
+            {1, 500},
+        )
+
+        for item in anime_episodes:
+            self.assertNotEqual(
+                item.resolution.status,
+                "resolved",
+            )
+            self.assertEqual(item.episode_additions, ())
+
+        # The entire dependent anime group is excluded.
+        # The unrelated ordinary TV history remains eligible.
+        eligible = selective.eligible
+
+        self.assertIsNotNone(eligible)
+        self.assertEqual(eligible.raw_record_count, 3)
+        self.assertEqual(eligible.review_count, 0)
+        self.assertEqual(eligible.episode_add_count, 2)
+
+        self.assertEqual(
+            {
+                item.tmdb_id
+                for item in eligible.items
+            },
+            {200},
+        )
+
+    async def test_anime_without_episode_history_remains_eligible(self):
+        from copy import deepcopy
+
+        payload = deepcopy(SIMKL_SERIES)
+        anime = payload["shows"].pop()
+
+        anime["anime_type"] = "tv"
+        anime["seasons"] = []
+        payload["anime"] = [anime]
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "watchlists.json"
+            path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+            plan = analyze_import(str(path))
+
+        resolution = await resolve_import_plan(
+            plan,
+            CountingTmdb(),
+        )
+
+        preview = build_database_preview(
+            resolution,
+            ExistingUserSnapshot(
+                user_id=1,
+                states={},
+                ratings={},
+                episodes={},
+                media=frozenset(),
+            ),
+        )
+
+        self.assertEqual(preview.review_count, 0)
+        self.assertEqual(preview.state_add_count, 1)
+        self.assertEqual(preview.rating_add_count, 1)
+        self.assertEqual(preview.episode_add_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
