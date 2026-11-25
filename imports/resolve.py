@@ -8,6 +8,7 @@ from imports.merge import (
     ImportPlanItem,
 )
 from models import MediaType, SearchResult
+from tmdb import TmdbError
 
 
 ResolutionStatus = Literal[
@@ -19,6 +20,7 @@ ResolutionStatus = Literal[
 ResolutionMethod = Literal[
     "tmdb_id",
     "imdb_id",
+    "tvdb_id",
     "title_year",
 ]
 
@@ -33,6 +35,12 @@ class ResolutionTmdb(Protocol):
     async def find_by_imdb(
         self,
         imdb_id: str,
+        limit: int = 8,
+    ) -> list[SearchResult]: ...
+
+    async def find_by_tvdb(
+        self,
+        tvdb_id: int,
         limit: int = 8,
     ) -> list[SearchResult]: ...
 
@@ -130,7 +138,14 @@ async def resolve_import_plan(
 
     lookup_cache: dict[
         tuple[MediaType, int],
-        SearchResult,
+        SearchResult | None,
+    ] = {}
+
+    imdb_cache: dict[str, tuple[SearchResult, ...]] = {}
+    tvdb_cache: dict[int, tuple[SearchResult, ...]] = {}
+    title_cache: dict[
+        tuple[MediaType | None, str],
+        tuple[SearchResult, ...],
     ] = {}
 
     for item in plan.items:
@@ -139,6 +154,9 @@ async def resolve_import_plan(
                 item,
                 tmdb,
                 lookup_cache=lookup_cache,
+                imdb_cache=imdb_cache,
+                tvdb_cache=tvdb_cache,
+                title_cache=title_cache,
             )
         )
 
@@ -155,7 +173,13 @@ async def _resolve_item(
     *,
     lookup_cache: dict[
         tuple[MediaType, int],
-        SearchResult,
+        SearchResult | None,
+    ],
+    imdb_cache: dict[str, tuple[SearchResult, ...]],
+    tvdb_cache: dict[int, tuple[SearchResult, ...]],
+    title_cache: dict[
+        tuple[MediaType | None, str],
+        tuple[SearchResult, ...],
     ],
 ) -> ResolvedImportItem:
     record = item.proposed
@@ -200,19 +224,33 @@ async def _resolve_item(
             record.tmdb_id,
         )
 
-        result = lookup_cache.get(
-            lookup_key
-        )
+        # Cache successful identities and confirmed HTTP 404 results
+        # for this import only. Service failures must propagate.
+        if lookup_key not in lookup_cache:
+            try:
+                lookup_cache[lookup_key] = (
+                    await tmdb.lookup_result(
+                        expected_type,
+                        record.tmdb_id,
+                    )
+                )
+            except TmdbError as exc:
+                if not exc.is_not_found:
+                    raise
+
+                lookup_cache[lookup_key] = None
+
+        result = lookup_cache[lookup_key]
 
         if result is None:
-            result = await tmdb.lookup_result(
-                expected_type,
-                record.tmdb_id,
+            return _unresolved(
+                item,
+                method="tmdb_id",
+                reason=(
+                    "Supplied TMDB ID was not found in the "
+                    "expected media namespace."
+                ),
             )
-
-            lookup_cache[
-                lookup_key
-            ] = result
 
         if not _claimed_identity_consistent(
             item,
@@ -238,10 +276,15 @@ async def _resolve_item(
     # IMDb IDs are exact external identifiers. TMDB /find is preferable to
     # fuzzy title matching whenever one is available.
     if record.imdb_id:
-        results = await tmdb.find_by_imdb(
-            record.imdb_id,
-            limit=8,
-        )
+        if record.imdb_id not in imdb_cache:
+            imdb_cache[record.imdb_id] = tuple(
+                await tmdb.find_by_imdb(
+                    record.imdb_id,
+                    limit=8,
+                )
+            )
+
+        results = imdb_cache[record.imdb_id]
 
         candidates = _filter_type(
             results,
@@ -289,6 +332,7 @@ async def _resolve_item(
             item,
             tmdb,
             expected_type,
+            title_cache=title_cache,
         )
 
         if fallback:
@@ -308,12 +352,94 @@ async def _resolve_item(
             reason="IMDb ID did not resolve to a compatible TMDB identity.",
         )
 
+    # TVDB identifiers refer to television identities, not movies.
+    # A supplied external ID must not be bypassed by title auto-matching.
+    if record.tvdb_id is not None:
+        if record.tvdb_id not in tvdb_cache:
+            tvdb_cache[record.tvdb_id] = tuple(
+                await tmdb.find_by_tvdb(
+                    record.tvdb_id,
+                    limit=8,
+                )
+            )
+
+        results = tvdb_cache[record.tvdb_id]
+
+        candidates = tuple(
+            candidate
+            for candidate in _filter_type(
+                results,
+                expected_type,
+            )
+            if candidate.media_type == "tv"
+        )
+
+        if len(candidates) == 1:
+            candidate = candidates[0]
+
+            if not _claimed_identity_consistent(
+                item,
+                candidate,
+            ):
+                return _review(
+                    item,
+                    method="tvdb_id",
+                    candidates=(candidate,),
+                    reason=(
+                        "TVDB ID resolved uniquely, but the TMDB "
+                        "title/year conflicts with the export record."
+                    ),
+                )
+
+            return _resolved(
+                item,
+                candidate,
+                method="tvdb_id",
+                reason="TVDB external ID resolved uniquely through TMDB.",
+            )
+
+        if len(candidates) > 1:
+            return _review(
+                item,
+                method="tvdb_id",
+                candidates=candidates,
+                reason=(
+                    "TVDB external ID returned multiple compatible "
+                    "TMDB identities."
+                ),
+            )
+
+        fallback = await _title_candidates(
+            item,
+            tmdb,
+            expected_type,
+            title_cache=title_cache,
+        )
+
+        if fallback:
+            return _review(
+                item,
+                method="title_year",
+                candidates=fallback,
+                reason=(
+                    "TVDB ID did not resolve through TMDB; title/year "
+                    "matches are shown for manual review only."
+                ),
+            )
+
+        return _unresolved(
+            item,
+            method="tvdb_id",
+            reason="TVDB ID did not resolve to a compatible TMDB identity.",
+        )
+
     # No strong external identity exists. Title/year can auto-resolve only
     # when there is exactly one exact compatible result.
     candidates = await _title_candidates(
         item,
         tmdb,
         expected_type,
+        title_cache=title_cache,
     )
 
     if not candidates:
@@ -359,6 +485,11 @@ async def _title_candidates(
     item: ImportPlanItem,
     tmdb: ResolutionTmdb,
     expected_type: MediaType | None,
+    *,
+    title_cache: dict[
+        tuple[MediaType | None, str],
+        tuple[SearchResult, ...],
+    ],
 ) -> tuple[SearchResult, ...]:
     record = item.proposed
 
@@ -372,6 +503,16 @@ async def _title_candidates(
         and record.media_type == "episode"
     ):
         return ()
+
+    # Preserve the exact query and media namespace. Empty results
+    # are cached as well, but exceptions are never cached.
+    cache_key = (
+        expected_type,
+        record.title,
+    )
+
+    if cache_key in title_cache:
+        return title_cache[cache_key]
 
     if expected_type == "movie":
         results = await tmdb.search_movie(
@@ -391,7 +532,9 @@ async def _title_candidates(
             limit=8,
         )
 
-    return tuple(results[:8])
+    title_cache[cache_key] = tuple(results[:8])
+
+    return title_cache[cache_key]
 
 
 def _canonical_media_type(
@@ -411,7 +554,7 @@ def _canonical_media_type(
 
 
 def _filter_type(
-    results: list[SearchResult],
+    results: list[SearchResult] | tuple[SearchResult, ...],
     expected_type: MediaType | None,
 ) -> tuple[SearchResult, ...]:
     if expected_type is None:

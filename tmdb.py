@@ -28,6 +28,19 @@ CACHE_SECONDS = 600.0
 class TmdbError(RuntimeError):
     """Raised when a TMDB request fails or returns malformed data."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def is_not_found(self) -> bool:
+        return self.status_code == 404
+
 
 class TmdbClient:
     def __init__(
@@ -57,12 +70,38 @@ class TmdbClient:
             async with self._session.get(
                 f"{API_BASE}{path}", headers=headers, params=query
             ) as response:
-                payload = await response.json(content_type=None)
+                try:
+                    payload = await response.json(content_type=None)
+                except (ValueError, UnicodeError) as exc:
+                    if response.status >= 400:
+                        raise TmdbError(
+                            f"TMDB request failed: HTTP {response.status}",
+                            status_code=response.status,
+                        ) from exc
+
+                    raise TmdbError(
+                        "TMDB returned malformed JSON."
+                    ) from exc
+
                 if response.status >= 400:
-                    message = payload.get("status_message", f"HTTP {response.status}")
-                    raise TmdbError(f"TMDB request failed: {message}")
+                    message = f"HTTP {response.status}"
+
+                    if isinstance(payload, dict):
+                        detail = payload.get("status_message")
+
+                        if isinstance(detail, str) and detail.strip():
+                            message = f"{message}: {detail}"
+
+                    raise TmdbError(
+                        f"TMDB request failed: {message}",
+                        status_code=response.status,
+                    )
+
                 if not isinstance(payload, dict):
-                    raise TmdbError("TMDB returned an unexpected response.")
+                    raise TmdbError(
+                        "TMDB returned an unexpected response."
+                    )
+
                 return payload
         except TimeoutError as exc:
             raise TmdbError("TMDB request timed out.") from exc
@@ -137,6 +176,24 @@ class TmdbClient:
         )
 
         return parsed[:limit]
+
+    async def find_by_tvdb(
+        self,
+        tvdb_id: int,
+        limit: int = 8,
+    ) -> list[SearchResult]:
+        """Resolve a TVDB external ID to TMDB television series."""
+
+        payload = await self._get(
+            f"/find/{tvdb_id}",
+            external_source="tvdb_id",
+        )
+
+        # Never interpret TVDB season or episode results as series IDs.
+        return self._parse_results(
+            payload.get("tv_results", []),
+            "tv",
+        )[:limit]
 
     async def search_multi(self, query: str, limit: int = 8) -> list[SearchResult]:
         payload = await self._get(
