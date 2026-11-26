@@ -1,8 +1,10 @@
 # Changelog
 
-## Media Library and Release Intelligence (development)
+## 0.2.0 — 2026-11-25
 
-### Added
+### Personal Media Library and Release Intelligence
+
+#### Added
 
 - Interactive personal library with complete pagination.
 - Film, television and documentary category filters.
@@ -15,7 +17,7 @@
 - Refresh-all progress reporting in the release schedule.
 - Visible tracker import processing feedback.
 
-### Changed
+#### Changed
 
 - Personal progress groups films, television series and documentaries
   before pagination.
@@ -23,7 +25,7 @@
 - Media cards include available release information.
 - Import application and release metadata refresh are mutually exclusive.
 
-### Fixed
+#### Fixed
 
 - Library state refreshes after watched and watchlist changes,
   invalidating previously issued action buttons.
@@ -32,16 +34,15 @@
   while the same refresh worker remains active.
 - Personal library timestamp sorting handles mixed formats and offsets.
 
-### Database
+#### Database
 
 - Adds the `release_cache` table without replacing existing personal
   viewing records.
 - Existing tracker imports, ratings and episode history are retained.
 
+### Tracker Imports and Core Improvements
 
-## Unreleased
-
-### Added
+#### Added
 
 - Native IMDb, Letterboxd, Trakt, and Simkl tracker imports.
 - Private import previews with explicit approval.
@@ -54,7 +55,7 @@
 - Explicit JustWatch attribution when streaming-provider availability is displayed.
 - Media-aware classification for films, documentary films, TV series, limited series, documentary series, and documentary limited series.
 - Classification-specific output cards with series status, season count, episode count, episode runtime, network/platform, and original-run dates.
-- Personal watchlists keyed by chat ID and Telegram user ID.
+- Personal watchlists and viewing state keyed by Telegram user ID and media identity.
 - Personal movie and documentary-film watched status.
 - Personal TV, miniseries, and documentary-series episode progress.
 - Individual episode toggles, season-wide controls, mark-all-released, Watching, Caught up, Completed, and clear-progress actions.
@@ -67,7 +68,7 @@
 - Owner-only command authorization through `OWNER_USER_IDS`.
 - `/adminhelp`, `/whoami`, `/groups`, `/leave`, `/leavechat`, `/status`, `/reload`, `/restart`, and `/shutdown`.
 
-### Changed
+#### Changed
 
 - Reorganized Telegram handlers under `handlers/` and artwork under `assets/` so the repository layout matches the runtime imports and asset paths.
 - Revamped the project README for standalone GitHub publication and deployment.
@@ -80,7 +81,7 @@
 - Owner callbacks bypass the normal group allowlist while still requiring an owner ID.
 - Logging reconfiguration closes replaced handlers cleanly.
 
-### Fixed
+#### Fixed
 
 - Order-dependent verification of imported series and episode history.
 - Import session recovery following failed Telegram message delivery.

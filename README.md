@@ -16,7 +16,9 @@
 
 **Command-driven discovery · Personal progress · Group watchlists · TMDB-powered metadata**
 
-**Current development version: `v0.2.0-dev`**
+**Current version: `v0.2.0`**
+
+[Release notes](docs/releases/v0.2.0.md)
 
 </div>
 
