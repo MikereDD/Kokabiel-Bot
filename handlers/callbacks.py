@@ -21,6 +21,7 @@ from handlers.common import (
     user_identity,
 )
 from handlers.imports import import_callback_router
+from handlers.library import library_callback
 from handlers.owner import owner_callback_router
 from keyboards import (
     EPISODE_PAGE_SIZE,
@@ -47,6 +48,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     if data.startswith("own|"):
         await owner_callback_router(update, context)
+        return
+
+    if data.startswith("lib|"):
+        await library_callback(update, context)
         return
 
     if data.startswith("imp|"):

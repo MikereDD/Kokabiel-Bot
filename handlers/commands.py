@@ -12,6 +12,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from credits import ABOUT_CAPTION
+from handlers.library import open_library
 from formatting import (
     group_watchlist_text,
     media_caption,
@@ -45,6 +46,9 @@ HELP_TEXT = """<b>Kokabiel commands</b>
 /random — choose from the group watchlist
 
 <b>Personal</b>
+/mylibrary — browse your complete media library
+/myratings — browse your personal ratings
+/myreleases — show upcoming releases in your library
 /mywatchlist — show your personal watchlist
 /watched — show your watched, caught-up, and completed titles
 /myprogress — show your film, TV, and documentary progress
@@ -153,69 +157,36 @@ async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def mywatchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await allowed(update, context):
-        return
-    user_id, user_name = user_identity(update)
-    entries = await database(context).list_personal_watchlist(
-        update.effective_chat.id, user_id
-    )
-    await reply_personal_text(
+async def mywatchlist(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await open_library(
         update,
         context,
-        personal_list_text(f"{user_name}’s watchlist", entries),
-        parse_mode=ParseMode.HTML,
+        collection="watchlist",
     )
 
 
-async def watched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await allowed(update, context):
-        return
-    user_id, user_name = user_identity(update)
-    entries = await database(context).list_personal_watched(
-        update.effective_chat.id, user_id
-    )
-    await reply_personal_text(
+async def watched(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await open_library(
         update,
         context,
-        personal_list_text(f"{user_name}’s watched titles", entries),
-        parse_mode=ParseMode.HTML,
+        collection="watched",
     )
 
 
-async def myprogress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await allowed(update, context):
-        return
-
-    user_id, user_name = user_identity(update)
-    loading_message = await reply_personal_text(
+async def myprogress(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await open_library(
         update,
         context,
-        "🎞 Loading your media progress…",
-        parse_mode=ParseMode.HTML,
-    )
-    if loading_message is None:
-        return
-
-    entries = await database(context).list_personal_progress(
-        update.effective_chat.id, user_id
-    )
-
-    released_counts = await _progress_released_counts(
-        context,
-        entries[:30],
-    )
-
-    await edit_personal_text(
-        context,
-        loading_message,
-        user_id,
-        personal_progress_text(
-            user_name,
-            entries,
-            released_counts,
-        ),
-        parse_mode=ParseMode.HTML,
+        collection="progress",
     )
 
 

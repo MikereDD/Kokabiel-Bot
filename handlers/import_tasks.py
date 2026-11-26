@@ -17,6 +17,9 @@ from handlers.imports import (
 )
 
 
+from release_refresh import RELEASE_REFRESH_ACTIVE_KEY
+
+
 IMPORT_TASK_MANAGER_KEY = "kokabiel_import_task_manager"
 
 MAX_ACTIVE_IMPORTS = 2
@@ -167,6 +170,17 @@ class ImportTaskManager:
             return (
                 "Kokabiel is processing other imports. "
                 "Please try again shortly."
+            )
+
+        if (
+            writer
+            and application.bot_data.get(
+                RELEASE_REFRESH_ACTIVE_KEY
+            )
+        ):
+            return (
+                "Release information is being refreshed. "
+                "Please apply your import after it finishes."
             )
 
         if writer and self.writer_count >= MAX_ACTIVE_WRITERS:

@@ -287,6 +287,184 @@ class SelectiveUploadTests(
         )
 
 
+
+    def install_progress_message(self):
+        status = SimpleNamespace(
+            edit_text=AsyncMock(),
+        )
+
+        self.update.effective_message.reply_text = AsyncMock(
+            return_value=status,
+        )
+
+        return status
+
+    async def test_progress_stages_and_preview_reuse(self):
+        status = self.install_progress_message()
+        before = self.database.read_bytes()
+
+        async def resolve(*args, **kwargs):
+            self.update.effective_message.reply_text.assert_awaited_once()
+            self.assertEqual(status.edit_text.await_count, 2)
+
+            self.assertIn(
+                "Resolving media identities",
+                status.edit_text.await_args.kwargs["text"],
+            )
+
+            self.assertEqual(
+                self.current_session().state,
+                "processing",
+            )
+
+            self.writer.assert_not_called()
+
+            return self.mixed_source()
+
+        with patch.object(
+            workflow,
+            "resolve_import_plan",
+            new=AsyncMock(side_effect=resolve),
+        ):
+            await workflow.receive_import_document(
+                self.update,
+                self.context,
+            )
+
+        self.assertEqual(status.edit_text.await_count, 4)
+
+        acknowledgement = (
+            self.update.effective_message.reply_text
+            .await_args.args[0]
+        )
+
+        self.assertIn(
+            "Downloading your tracker export",
+            acknowledgement,
+        )
+
+        edits = status.edit_text.await_args_list
+
+        for call, expected in zip(
+            edits[:3],
+            (
+                "Analyzing tracker records",
+                "Resolving media identities",
+                "Comparing with your existing collection",
+            ),
+        ):
+            self.assertIn(expected, call.kwargs["text"])
+            self.assertIsNone(call.kwargs["reply_markup"])
+
+        markup = edits[-1].kwargs["reply_markup"]
+
+        actions = {
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        }
+
+        self.assertIn(
+            "imp|prepare_verified|original",
+            actions,
+        )
+
+        self.assertNotIn("imp|apply|original", actions)
+        self.assertEqual(self.current_session().state, "ready")
+        self.assertIsNone(self.current_session().path)
+        self.reply.assert_not_awaited()
+        self.writer.assert_not_called()
+        self.assertEqual(self.database.read_bytes(), before)
+
+    async def test_progress_edit_failure_falls_back(self):
+        from telegram.error import TimedOut
+
+        status = self.install_progress_message()
+        status.edit_text.side_effect = TimedOut()
+
+        await self.upload(self.mixed_source())
+
+        self.assertEqual(status.edit_text.await_count, 4)
+        self.reply.assert_awaited_once()
+        self.assertEqual(self.current_session().state, "ready")
+
+    async def test_progress_acknowledgement_failure(self):
+        from telegram.error import TimedOut
+
+        self.install_progress_message()
+
+        self.update.effective_message.reply_text.side_effect = (
+            TimedOut()
+        )
+
+        await self.upload(self.mixed_source())
+
+        self.reply.assert_awaited_once()
+        self.assertEqual(self.current_session().state, "ready")
+
+    async def test_progress_resolution_error(self):
+        status = self.install_progress_message()
+        before = self.database.read_bytes()
+
+        with patch.object(
+            workflow,
+            "resolve_import_plan",
+            new=AsyncMock(
+                side_effect=workflow.TmdbError(
+                    "Synthetic resolution failure"
+                )
+            ),
+        ):
+            await workflow.receive_import_document(
+                self.update,
+                self.context,
+            )
+
+        self.assertIn(
+            "No database changes were made",
+            status.edit_text.await_args.kwargs["text"],
+        )
+
+        self.assertIsNone(
+            status.edit_text.await_args.kwargs["reply_markup"],
+        )
+
+        self.assertEqual(
+            self.current_session().state,
+            "awaiting_upload",
+        )
+
+        self.assertIsNone(self.current_session().path)
+        self.writer.assert_not_called()
+        self.assertEqual(self.database.read_bytes(), before)
+
+    async def test_progress_cancellation_cleans_upload(self):
+        import asyncio
+
+        status = self.install_progress_message()
+        status.edit_text.side_effect = asyncio.CancelledError()
+
+        before = self.database.read_bytes()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await workflow.receive_import_document(
+                self.update,
+                self.context,
+            )
+
+        self.assertIsNone(self.current_session())
+        self.writer.assert_not_called()
+        self.assertEqual(self.database.read_bytes(), before)
+
+        upload = workflow._quarantine_path(
+            self.database,
+            1,
+            "original",
+            "ratings.csv",
+        )
+
+        self.assertFalse(upload.exists())
+
     def snapshot(self):
         return load_existing_user_snapshot(
             self.database,

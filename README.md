@@ -240,3 +240,27 @@ See [`LICENSE.md`](LICENSE.md) for the complete source-code notice.
 **Kokabiel · Typezer∅**
 
 </div>
+
+
+## Personal Media Library and Release Intelligence
+
+Kokabiel provides an interactive, paginated personal media
+library with category filters, sorting, viewing progress,
+watchlists and ratings.
+
+Commands:
+
+- `/mylibrary` — browse your complete personal library.
+- `/mywatchlist` — browse your personal watchlist.
+- `/watched` — browse watched titles.
+- `/myprogress` — browse viewing progress.
+- `/myratings` — browse your personal ratings.
+- `/myreleases` — view upcoming releases from tracked titles.
+
+The release schedule supports 7, 30 and 90-day windows,
+persistent metadata caching and user-requested refresh.
+Choose a single batch or refresh all tracked titles with
+background progress reporting.
+
+See [Media Library and Release Intelligence](docs/media-library-release-intelligence.md)
+for behavior, metadata limitations and migration information.

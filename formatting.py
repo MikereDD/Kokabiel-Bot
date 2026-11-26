@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import escape
+from datetime import date
 
 from models import (GroupEntry, MediaDetails, PersonalEntry, SearchResult,
                     SuggestionEntry)
@@ -18,6 +19,242 @@ def selection_label(result: SearchResult) -> str:
     return _truncate_plain(label, 60)
 
 
+
+def _release_date(value):
+    if not isinstance(value, str):
+        return None
+
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+
+    return parsed if parsed.isoformat() == value else None
+
+
+def _display_date(value):
+    return f"{value:%b} {value.day}, {value.year}"
+
+
+def _fit_escaped(value: str, budget: int) -> str:
+    """Fit escaped text without splitting an HTML entity."""
+
+    if budget <= 0:
+        return ""
+
+    encoded = escape(value)
+
+    if len(encoded) <= budget:
+        return encoded
+
+    low, high = 0, len(value)
+
+    while low < high:
+        middle = (low + high + 1) // 2
+
+        if len(escape(value[:middle])) + 1 <= budget:
+            low = middle
+        else:
+            high = middle - 1
+
+    return escape(value[:low].rstrip()) + "…"
+
+
+def release_information_lines(
+    details: MediaDetails,
+    *,
+    today: date | None = None,
+    compact: bool = False,
+) -> list[str]:
+
+    today = today or date.today()
+    lines = []
+
+    if details.media_type == "movie":
+        original = _release_date(details.release_date)
+
+        lines.append(
+            "<b>Release date:</b> "
+            + (
+                _display_date(original)
+                if original
+                else "Not listed"
+            )
+        )
+
+        region = _fit_escaped(
+            details.release_region or "Region",
+            12,
+        )
+
+        kinds = (2, 3, 4, 5) if compact else range(1, 7)
+
+        labels = {
+            1: "Premiere",
+            2: "Limited theatrical",
+            3: "Theatrical",
+            4: "Digital",
+            5: "Physical media",
+            6: "Television",
+        }
+
+        for kind in kinds:
+            dates = sorted({
+                parsed
+                for event in details.release_events
+                if event.release_type == kind
+                and event.region == details.release_region
+                and (parsed := _release_date(event.date))
+            })
+
+            if not dates:
+                continue
+
+            upcoming = [
+                value for value in dates
+                if value >= today
+            ]
+
+            selected = upcoming[0] if upcoming else dates[0]
+
+            lines.append(
+                f"<b>{region} {labels[kind]}:</b> "
+                f"{_display_date(selected)}"
+            )
+
+        return lines
+
+    lines.append(
+        "<b>Series status:</b> "
+        + escape(details.lifecycle_label)
+    )
+
+    premiere = _release_date(details.first_air_date)
+
+    lines.append(
+        "<b>Premiere:</b> "
+        + (
+            _display_date(premiere)
+            if premiere
+            else "Not listed"
+        )
+    )
+
+    if not compact:
+        last = _release_date(details.last_air_date)
+
+        if last:
+            lines.append(
+                "<b>Last listed air date:</b> "
+                + _display_date(last)
+            )
+
+    if details.lifecycle_label in {"Ended", "Canceled"}:
+        return lines
+
+    episode = details.next_episode
+
+    if episode is not None:
+        air_date = _release_date(episode.air_date)
+
+        if air_date is None or air_date >= today:
+            coordinate = (
+                f"S{episode.season_number:02d}"
+                f"E{episode.episode_number:02d}"
+            )
+
+            lines.append(
+                f"<b>Next episode:</b> {coordinate}"
+            )
+
+            if not compact:
+                lines.append(
+                    _fit_escaped(episode.name, 160)
+                )
+
+            lines.append(
+                "<b>Air date:</b> "
+                + (
+                    _display_date(air_date)
+                    if air_date
+                    else "Not announced"
+                )
+            )
+
+            if episode.runtime and not compact:
+                lines.append(
+                    f"<b>Runtime:</b> {episode.runtime} min"
+                )
+
+    upcoming_seasons = sorted(
+        (
+            air_date,
+            season.season_number,
+        )
+        for season in details.seasons
+        if season.season_number > 0
+        and (air_date := _release_date(season.air_date))
+        and air_date >= today
+    )
+
+    if upcoming_seasons:
+        air_date, number = upcoming_seasons[0]
+
+        lines.append(
+            f"<b>Season {number} premiere:</b> "
+            f"{_display_date(air_date)}"
+        )
+
+    if (
+        not upcoming_seasons
+        and (
+            episode is None
+            or (
+                _release_date(episode.air_date)
+                and _release_date(episode.air_date) < today
+            )
+        )
+    ):
+        lines.append(
+            "<i>No upcoming air date listed.</i>"
+        )
+
+    return lines
+
+
+def release_information_text(
+    details: MediaDetails,
+    *,
+    today: date | None = None,
+) -> str:
+
+    lines = [
+        f"{details.icon} <b>"
+        f"{_fit_escaped(details.title, 240)}</b>",
+        escape(details.type_label),
+        "",
+        "<b>📅 Release information</b>",
+        "",
+        *release_information_lines(
+            details,
+            today=today,
+        ),
+        "",
+    ]
+
+    if details.media_type == "movie":
+        lines.append(
+            "<i>Regional dates show the next listed release "
+            "or the first listed release if none is upcoming.</i>"
+        )
+
+    lines.append(
+        "<i>Dates supplied by TMDB and subject to change.</i>"
+    )
+
+    return "\n".join(lines)
+
+
 def media_caption(
     details: MediaDetails,
     *,
@@ -25,7 +262,7 @@ def media_caption(
     rating_count: int = 0,
 ) -> str:
     heading = (
-        f"{details.icon} <b>{escape(details.title)}</b> " f"({_display_years(details)})"
+        f"{details.icon} <b>{_fit_escaped(details.title, 320)}</b> " f"({_display_years(details)})"
     )
 
     metadata = [details.type_label]
@@ -33,10 +270,17 @@ def media_caption(
         metadata.append(details.runtime)
     if details.certification:
         metadata.append(details.certification)
-    if details.media_type == "tv" and details.tmdb_status:
-        metadata.append(details.tmdb_status)
+    lines = [
+        heading,
+        _fit_escaped(" · ".join(metadata), 160),
+    ]
 
-    lines = [heading, " · ".join(escape(item) for item in metadata)]
+    lines.extend(
+        release_information_lines(
+            details,
+            compact=True,
+        )
+    )
 
     if details.original_title.casefold() != details.title.casefold():
         lines.append(f"<b>Original title:</b> {escape(details.original_title)}")
@@ -80,18 +324,29 @@ def media_caption(
     if details.streaming:
         lines.append(f"<b>Stream:</b> {escape(', '.join(details.streaming))}")
 
-    overview = escape(details.overview.strip() or "No synopsis is currently available.")
-    prefix = "\n".join(lines) + "\n\n"
+    overview = details.overview.strip() or "No synopsis is currently available."
     provider_attribution = bool(details.streaming or details.rent or details.buy)
     suffix = "\n\n<i>Media data supplied by TMDB."
     if provider_attribution:
         suffix += " Streaming availability powered by JustWatch."
     suffix += "</i>"
+    retained = []
+
+    for line in lines:
+        candidate = "\n".join([*retained, line]) + "\n\n"
+
+        if len(candidate) + len(suffix) <= TELEGRAM_PHOTO_CAPTION_LIMIT:
+            retained.append(line)
+
+    prefix = "\n".join(retained) + "\n\n"
     room = TELEGRAM_PHOTO_CAPTION_LIMIT - len(prefix) - len(suffix)
-    if room < 40:
-        overview = ""
-    elif len(overview) > room:
-        overview = overview[: max(0, room - 1)].rstrip() + "…"
+
+    overview = (
+        _fit_escaped(overview, room)
+        if room >= 40
+        else ""
+    )
+
     return prefix + overview + suffix
 
 

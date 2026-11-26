@@ -247,6 +247,17 @@ async def reload_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     manager = import_task_manager(context.application)
 
+    from release_refresh import RELEASE_REFRESH_ACTIVE_KEY
+
+    if context.application.bot_data.get(
+        RELEASE_REFRESH_ACTIVE_KEY
+    ):
+        await update.effective_message.reply_text(
+            "Configuration cannot be reloaded while "
+            "release information is being refreshed."
+        )
+        return
+
     if manager.active_count:
         await update.effective_message.reply_text(
             "Configuration cannot be reloaded while an "

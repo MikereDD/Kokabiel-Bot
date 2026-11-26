@@ -3,10 +3,19 @@ from __future__ import annotations
 import asyncio
 import random
 import sqlite3
+import json
+from dataclasses import asdict, replace
 from collections.abc import Callable, Iterable
 from contextlib import closing
 from pathlib import Path
 from typing import TypeVar
+
+from release_intelligence import (
+    ReleaseCandidate,
+    ReleaseSnapshot,
+    ScheduledRelease,
+    build_release_snapshot,
+)
 
 from models import (
     GroupEntry,
@@ -15,6 +24,7 @@ from models import (
     MediaDetails,
     MediaType,
     PersonalEntry,
+    PersonalLibraryPage,
     SuggestionEntry,
     UserMediaState,
     ViewingStatus,
@@ -140,6 +150,19 @@ CREATE TABLE IF NOT EXISTS known_chats (
     is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS release_cache (
+    media_type TEXT NOT NULL,
+    tmdb_id INTEGER NOT NULL,
+    region TEXT NOT NULL,
+    checked_at INTEGER NOT NULL,
+    lifecycle TEXT NOT NULL,
+    events_json TEXT NOT NULL,
+    PRIMARY KEY (media_type, tmdb_id, region),
+    FOREIGN KEY (media_type, tmdb_id)
+        REFERENCES media(media_type, tmdb_id)
+        ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_known_chats_type_active
@@ -783,6 +806,395 @@ class Database:
     # ------------------------------------------------------------------
     # Lists and group aggregates
     # ------------------------------------------------------------------
+
+
+
+    async def store_release_snapshot(
+        self,
+        details: MediaDetails,
+        *,
+        region: str,
+        checked_at: int,
+        recover_future_checked_at: int | None = None,
+    ) -> bool:
+        """Cache metadata without modifying personal records.
+
+        Clock recovery requires an explicitly observed future
+        timestamp. A changed timestamp invalidates recovery.
+        """
+
+        if type(checked_at) is not int or checked_at < 0:
+            raise ValueError("Invalid metadata check timestamp")
+
+        if recover_future_checked_at is not None:
+            if (
+                type(recover_future_checked_at) is not int
+                or recover_future_checked_at <= checked_at
+            ):
+                raise ValueError("Invalid future timestamp recovery")
+
+        snapshot = build_release_snapshot(
+            details,
+            region=region,
+        )
+
+        events_json = json.dumps(
+            [asdict(event) for event in snapshot.events],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            cursor = connection.execute(
+                """
+                INSERT INTO release_cache (
+                    media_type, tmdb_id, region,
+                    checked_at, lifecycle, events_json
+                )
+                SELECT ?, ?, ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1 FROM media
+                    WHERE media_type = ?
+                      AND tmdb_id = ?
+                )
+                ON CONFLICT(media_type, tmdb_id, region)
+                DO UPDATE SET
+                    checked_at = excluded.checked_at,
+                    lifecycle = excluded.lifecycle,
+                    events_json = excluded.events_json
+                WHERE (
+                    ? IS NULL
+                    AND excluded.checked_at
+                        >= release_cache.checked_at
+                )
+                OR (
+                    ? IS NOT NULL
+                    AND release_cache.checked_at = ?
+                    AND release_cache.checked_at
+                        > excluded.checked_at
+                )
+                """,
+                (
+                    details.media_type,
+                    details.tmdb_id,
+                    region,
+                    checked_at,
+                    snapshot.lifecycle,
+                    events_json,
+                    details.media_type,
+                    details.tmdb_id,
+                    recover_future_checked_at,
+                    recover_future_checked_at,
+                    recover_future_checked_at,
+                ),
+            )
+
+            return cursor.rowcount == 1
+
+        return await self._write(operation)
+
+    async def release_candidates(
+        self,
+        user_id: int,
+        *,
+        region: str,
+    ) -> tuple[ReleaseCandidate, ...]:
+        """Return only this user's followed media."""
+
+        def operation(connection: sqlite3.Connection):
+            rows = connection.execute(
+                """
+                SELECT m.media_type,
+                       m.tmdb_id,
+                       m.title,
+                       m.media_class,
+                       rc.checked_at,
+                       rc.lifecycle,
+                       rc.events_json
+                FROM user_media_state ums
+                JOIN media m USING (media_type, tmdb_id)
+                LEFT JOIN release_cache rc
+                    ON rc.media_type = m.media_type
+                    AND rc.tmdb_id = m.tmdb_id
+                    AND rc.region = ?
+                WHERE ums.user_id = ?
+                  AND (
+                    ums.watchlist = 1
+                    OR (
+                        ums.media_type = 'tv'
+                        AND ums.viewing_status IN (
+                            'watching', 'caught_up'
+                        )
+                    )
+                  )
+                ORDER BY m.media_type, m.tmdb_id
+                """,
+                (region, user_id),
+            ).fetchall()
+
+            candidates = []
+
+            for row in rows:
+                snapshot = None
+
+                if row["checked_at"] is not None:
+                    snapshot = ReleaseSnapshot(
+                        lifecycle=row["lifecycle"],
+                        events=tuple(
+                            ScheduledRelease(**event)
+                            for event in json.loads(
+                                row["events_json"]
+                            )
+                        ),
+                    )
+
+                candidates.append(
+                    ReleaseCandidate(
+                        media_type=row["media_type"],
+                        tmdb_id=row["tmdb_id"],
+                        title=row["title"],
+                        media_class=row["media_class"],
+                        checked_at=row["checked_at"],
+                        snapshot=snapshot,
+                    )
+                )
+
+            return tuple(candidates)
+
+        return await self._read(operation)
+
+    async def personal_library_page(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        collection: str = "all",
+        category: str = "all",
+        sort: str = "updated",
+        status: str = "all",
+        page: int = 0,
+        page_size: int = 8,
+    ) -> PersonalLibraryPage:
+        """Read one consistent page of the user's global library."""
+
+        collections = {
+            "all": "1 = 1",
+            "watchlist": "watchlist = 1",
+            "watched": (
+                "viewing_status IN "
+                "('watched', 'caught_up', 'completed')"
+            ),
+            "progress": "viewing_status != 'none'",
+            "ratings": "rating IS NOT NULL",
+        }
+
+        documentary_classes = (
+            "('documentary_film', 'documentary_series', "
+            "'documentary_limited_series')"
+        )
+
+        categories = {
+            "all": "1 = 1",
+            "films": (
+                "media_type = 'movie' AND media_class NOT IN "
+                + documentary_classes
+            ),
+            "series": (
+                "media_type = 'tv' AND media_class NOT IN "
+                + documentary_classes
+            ),
+            "documentaries": (
+                "media_class IN " + documentary_classes
+            ),
+        }
+
+        sorts = {
+            "title": "title COLLATE NOCASE ASC, year ASC",
+            "updated": "julianday(updated_at) DESC",
+            "added": "julianday(created_at) DESC",
+            "year": "year DESC, title COLLATE NOCASE ASC",
+            "rating": (
+                "rating IS NULL ASC, rating DESC, "
+                "title COLLATE NOCASE ASC"
+            ),
+        }
+
+        statuses = {
+            "all",
+            "none",
+            "watching",
+            "watched",
+            "caught_up",
+            "completed",
+        }
+
+        if collection not in collections:
+            raise ValueError("Invalid library collection")
+
+        if category not in categories:
+            raise ValueError("Invalid library category")
+
+        if sort not in sorts:
+            raise ValueError("Invalid library sort")
+
+        if status not in statuses:
+            raise ValueError("Invalid viewing status")
+
+        if not isinstance(page, int) or page < 0:
+            raise ValueError("Invalid page")
+
+        if (
+            not isinstance(page_size, int)
+            or not 1 <= page_size <= 20
+        ):
+            raise ValueError("Invalid page size")
+
+        filters = [
+            collections[collection],
+            categories[category],
+        ]
+
+        params = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+        }
+
+        if status != "all":
+            filters.append("viewing_status = :status")
+            params["status"] = status
+
+        where = " AND ".join(
+            f"({item})" for item in filters
+        )
+
+        order = sorts[sort] + ", media_type ASC, tmdb_id ASC"
+
+        if collection == "progress" and category == "all":
+            order = (
+                "CASE "
+                "WHEN media_class LIKE 'documentary%' THEN 2 "
+                "WHEN media_type = 'movie' THEN 0 "
+                "ELSE 1 END ASC, "
+                + order
+            )
+
+        base = """
+            WITH identities AS (
+                SELECT media_type, tmdb_id
+                FROM user_media_state
+                WHERE user_id = :user_id
+
+                UNION
+
+                SELECT media_type, tmdb_id
+                FROM ratings
+                WHERE user_id = :user_id
+            ),
+            library AS (
+                SELECT
+                    COALESCE(
+                        ums.last_chat_id,
+                        :chat_id
+                    ) AS chat_id,
+                    :user_id AS user_id,
+                    m.media_type,
+                    m.tmdb_id,
+                    m.title,
+                    m.year,
+                    m.poster_url,
+                    m.media_class,
+                    COALESCE(ums.watchlist, 0) AS watchlist,
+                    COALESCE(
+                        ums.viewing_status, 'none'
+                    ) AS viewing_status,
+                    COALESCE(
+                        ums.created_at, r.rated_at
+                    ) AS created_at,
+                    CASE
+                        WHEN julianday(ums.updated_at) IS NULL
+                            THEN COALESCE(
+                                r.rated_at, ums.updated_at, ''
+                            )
+                        WHEN julianday(r.rated_at) IS NULL
+                            THEN ums.updated_at
+                        WHEN julianday(ums.updated_at)
+                             >= julianday(r.rated_at)
+                            THEN ums.updated_at
+                        ELSE r.rated_at
+                    END AS updated_at,
+                    r.rating AS rating
+                FROM identities i
+                JOIN media m USING (media_type, tmdb_id)
+                LEFT JOIN user_media_state ums
+                    ON ums.user_id = :user_id
+                    AND ums.media_type = m.media_type
+                    AND ums.tmdb_id = m.tmdb_id
+                LEFT JOIN ratings r
+                    ON r.user_id = :user_id
+                    AND r.media_type = m.media_type
+                    AND r.tmdb_id = m.tmdb_id
+            )
+        """
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> PersonalLibraryPage:
+
+            # Count and page must use the same SQLite snapshot.
+            connection.execute("BEGIN")
+
+            total = connection.execute(
+                base + f"SELECT COUNT(*) FROM library WHERE {where}",
+                params,
+            ).fetchone()[0]
+
+            page_count = max(
+                1,
+                (total + page_size - 1) // page_size,
+            )
+
+            current_page = min(page, page_count - 1)
+
+            page_params = {
+                **params,
+                "limit": page_size,
+                "offset": current_page * page_size,
+            }
+
+            rows = connection.execute(
+                base + f"""
+                SELECT library.*,
+                       CASE WHEN media_type = 'tv' THEN (
+                           SELECT COUNT(*)
+                           FROM episode_progress ep
+                           WHERE ep.user_id = :user_id
+                             AND ep.tmdb_id = library.tmdb_id
+                       ) ELSE 0 END AS watched_episodes
+                FROM library
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT :limit OFFSET :offset
+                """,
+                page_params,
+            ).fetchall()
+
+            entries = tuple(
+                replace(
+                    self._personal_from_row(row),
+                    rating=row["rating"],
+                )
+                for row in rows
+            )
+
+            return PersonalLibraryPage(
+                entries=entries,
+                total=total,
+                page=current_page,
+                page_size=page_size,
+            )
+
+        return await self._read(operation)
+
 
     async def list_personal_watchlist(
         self, chat_id: int, user_id: int, *, limit: int = 50

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import date as calendar_date
 from collections.abc import Iterable
 from typing import Any
 from urllib.parse import quote_plus
@@ -13,6 +14,7 @@ from models import (
     MediaClass,
     MediaDetails,
     MediaType,
+    ReleaseEvent,
     SearchResult,
     SeasonDetails,
     SeasonSummary,
@@ -222,11 +224,17 @@ class TmdbClient:
         combined.sort(key=lambda item: item.popularity, reverse=True)
         return combined[:limit]
 
-    async def details(self, media_type: MediaType, tmdb_id: int) -> MediaDetails:
+    async def details(
+        self,
+        media_type: MediaType,
+        tmdb_id: int,
+        *,
+        force_refresh: bool = False,
+    ) -> MediaDetails:
         cache_key = (media_type, tmdb_id)
         cached = self._details_cache.get(cache_key)
         now = time.monotonic()
-        if cached and now - cached[0] < CACHE_SECONDS:
+        if not force_refresh and cached and now - cached[0] < CACHE_SECONDS:
             return cached[1]
 
         appended = "credits,videos,external_ids,watch/providers"
@@ -408,8 +416,23 @@ class TmdbClient:
         number_of_episodes = 0
         networks: tuple[str, ...] = ()
         seasons: tuple[SeasonSummary, ...] = ()
+        release_date = None
+        release_region = None
+        release_events = ()
+        next_episode = None
 
         if media_type == "movie":
+            release_date = self._iso_date(
+                payload.get("release_date")
+            )
+            release_region = self._region
+            release_events = self._movie_release_events(
+                payload
+            )
+            tmdb_status = (
+                str(payload.get("status") or "").strip()
+                or None
+            )
             runtime = self._format_runtime(payload.get("runtime"))
             leads = self._directors(payload)
             certification = self._movie_certification(payload)
@@ -430,6 +453,9 @@ class TmdbClient:
             series_type = str(payload.get("type") or "").strip() or None
             tmdb_status = str(payload.get("status") or "").strip() or None
             series_status = self._series_status(tmdb_status)
+            next_episode = self._parse_next_episode(
+                payload.get("next_episode_to_air")
+            )
             first_air_date = str(payload.get("first_air_date")) if payload.get("first_air_date") else None
             last_air_date = str(payload.get("last_air_date")) if payload.get("last_air_date") else None
             number_of_seasons = int(payload.get("number_of_seasons") or 0)
@@ -505,6 +531,125 @@ class TmdbClient:
             number_of_episodes=number_of_episodes,
             networks=networks,
             seasons=seasons,
+            release_date=release_date,
+            release_region=release_region,
+            release_events=release_events,
+            next_episode=next_episode,
+        )
+
+
+    @staticmethod
+    def _iso_date(value, *, timestamp=False) -> str | None:
+        """Accept valid calendar dates without inventing missing dates."""
+
+        if not isinstance(value, str):
+            return None
+
+        if timestamp and "T" in value:
+            value = value.split("T", 1)[0]
+
+        if len(value) != 10:
+            return None
+
+        try:
+            parsed = calendar_date.fromisoformat(value)
+        except ValueError:
+            return None
+
+        return value if parsed.isoformat() == value else None
+
+    def _movie_release_events(self, payload):
+        release_data = payload.get("release_dates")
+
+        if not isinstance(release_data, dict):
+            return ()
+
+        regions = release_data.get("results")
+
+        if not isinstance(regions, list):
+            return ()
+
+        events = set()
+
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+
+            if region.get("iso_3166_1") != self._region:
+                continue
+
+            releases = region.get("release_dates")
+
+            if not isinstance(releases, list):
+                continue
+
+            for release in releases:
+                if not isinstance(release, dict):
+                    continue
+
+                kind = release.get("type")
+
+                if type(kind) is not int or not 1 <= kind <= 6:
+                    continue
+
+                date = self._iso_date(
+                    release.get("release_date"),
+                    timestamp=True,
+                )
+
+                if date is None:
+                    continue
+
+                events.add(
+                    ReleaseEvent(
+                        date=date,
+                        region=self._region,
+                        release_type=kind,
+                    )
+                )
+
+        return tuple(
+            sorted(
+                events,
+                key=lambda event: (
+                    event.date,
+                    event.release_type,
+                ),
+            )
+        )
+
+    def _parse_next_episode(self, payload):
+        if not isinstance(payload, dict):
+            return None
+
+        season = payload.get("season_number")
+        episode = payload.get("episode_number")
+
+        if (
+            type(season) is not int
+            or type(episode) is not int
+            or season < 0
+            or episode < 1
+        ):
+            return None
+
+        runtime = payload.get("runtime")
+
+        return EpisodeDetails(
+            season_number=season,
+            episode_number=episode,
+            name=str(
+                payload.get("name")
+                or f"Episode {episode}"
+            ),
+            air_date=self._iso_date(
+                payload.get("air_date")
+            ),
+            runtime=(
+                runtime
+                if type(runtime) is int and runtime > 0
+                else None
+            ),
         )
 
     @staticmethod

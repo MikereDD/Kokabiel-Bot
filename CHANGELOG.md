@@ -1,5 +1,44 @@
 # Changelog
 
+## Media Library and Release Intelligence (development)
+
+### Added
+
+- Interactive personal library with complete pagination.
+- Film, television and documentary category filters.
+- Personal rating, watchlist and viewing-progress navigation.
+- Regional film release dates, series premieres and upcoming episodes.
+- Distinct continuing, ended and canceled lifecycle information.
+- Persistent region-scoped release metadata cache.
+- Personal upcoming release schedule with 7, 30 and 90-day windows.
+- Bounded asynchronous single-batch and multi-batch metadata refresh.
+- Refresh-all progress reporting in the release schedule.
+- Visible tracker import processing feedback.
+
+### Changed
+
+- Personal progress groups films, television series and documentaries
+  before pagination.
+- Released episode totals can be retrieved for the visible page.
+- Media cards include available release information.
+- Import application and release metadata refresh are mutually exclusive.
+
+### Fixed
+
+- Library state refreshes after watched and watchlist changes,
+  invalidating previously issued action buttons.
+- Future-dated release metadata can recover after clock correction.
+- Persistent metadata failures no longer repeatedly monopolize batches
+  while the same refresh worker remains active.
+- Personal library timestamp sorting handles mixed formats and offsets.
+
+### Database
+
+- Adds the `release_cache` table without replacing existing personal
+  viewing records.
+- Existing tracker imports, ratings and episode history are retained.
+
+
 ## Unreleased
 
 ### Added

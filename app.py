@@ -18,6 +18,7 @@ from telegram.ext import (
 from config import ConfigError, load_settings
 from database import Database
 from handlers.callbacks import callback_router
+from handlers.library import mylibrary, myratings, myreleases
 from handlers.commands import (
     about,
     documentary,
@@ -66,6 +67,21 @@ from version import __version__
 LOGGER = logging.getLogger(__name__)
 
 COMMANDS = [
+    BotCommand(
+        "myreleases",
+        "Show your upcoming release schedule",
+        api_kwargs={"is_ephemeral": True},
+    ),
+    BotCommand(
+        "mylibrary",
+        "Browse your complete media library",
+        api_kwargs={"is_ephemeral": True},
+    ),
+    BotCommand(
+        "myratings",
+        "Browse your personal ratings",
+        api_kwargs={"is_ephemeral": True},
+    ),
     BotCommand("movie", "Search for a film"),
     BotCommand("tv", "Search for a TV series"),
     BotCommand("documentary", "Search for a documentary"),
@@ -195,6 +211,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("mywatchlist", mywatchlist))
     application.add_handler(CommandHandler("watched", watched))
     application.add_handler(CommandHandler("myprogress", myprogress))
+    application.add_handler(CommandHandler("mylibrary", mylibrary))
+    application.add_handler(CommandHandler("myratings", myratings))
+    application.add_handler(CommandHandler("myreleases", myreleases))
     application.add_handler(CommandHandler("suggestions", suggestions))
     application.add_handler(CommandHandler("mysuggestions", mysuggestions))
     application.add_handler(CommandHandler("random", random_pick))

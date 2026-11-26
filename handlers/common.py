@@ -107,6 +107,14 @@ async def send_personal_callback_text(
     if query is None or chat is None or user is None:
         return None
 
+    if chat.type == ChatType.PRIVATE:
+        return await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+
     return await context.bot.send_message(
         chat_id=chat.id,
         text=PRIVATE_LABEL + text,

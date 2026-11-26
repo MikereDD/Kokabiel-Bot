@@ -352,7 +352,84 @@ async def receive_import_document(
         IMPORT_SESSION_KEY
     ] = processing
 
+    status_message = None
+
+    async def update_status(text: str) -> None:
+        if status_message is None:
+            return
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not processing:
+            return
+
+        try:
+            await status_message.edit_text(
+                text=text,
+                parse_mode=None,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Import progress update failed (%s)",
+                type(exc).__name__,
+            )
+
+    async def deliver(
+        text: str,
+        *,
+        parse_mode=None,
+        reply_markup=None,
+    ) -> None:
+        expected = context.user_data.get(
+            IMPORT_SESSION_KEY
+        )
+
+        if status_message is not None:
+            try:
+                await status_message.edit_text(
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+                return
+
+            except Exception as exc:
+                LOGGER.warning(
+                    "Import message edit failed (%s)",
+                    type(exc).__name__,
+                )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not expected:
+            return
+
+        await reply_personal_text(
+            update,
+            context,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+
     try:
+        # Uploads have already passed private-chat, ownership,
+        # size and session validation.
+        try:
+            status_message = await message.reply_text(
+                "📥 Kokabiel — Importing your library\n\n"
+                "⏳ Downloading your tracker export…\n\n"
+                "No import changes have been applied.",
+                parse_mode=None,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Import progress acknowledgement failed (%s)",
+                type(exc).__name__,
+            )
+
         telegram_file = (
             await context.bot.get_file(
                 document.file_id
@@ -367,10 +444,26 @@ async def receive_import_document(
             0o600
         )
 
+        await update_status(
+            "📥 Kokabiel — Importing your library\n\n"
+            "✅ Export received\n"
+            "⏳ Analyzing tracker records…\n\n"
+            "No import changes have been applied."
+        )
+
         plan = await _run_import_worker(
             analyze_import,
             str(upload_path),
             source_name=source_name,
+        )
+
+        await update_status(
+            "📥 Kokabiel — Importing your library\n\n"
+            "✅ Export received\n"
+            "✅ Tracker records analyzed\n"
+            "⏳ Resolving media identities…\n\n"
+            "Large collections may take longer.\n"
+            "No import changes have been applied."
         )
 
         resolution = (
@@ -378,6 +471,15 @@ async def receive_import_document(
                 plan,
                 tmdb(context),
             )
+        )
+
+        await update_status(
+            "📥 Kokabiel — Importing your library\n\n"
+            "✅ Export analyzed\n"
+            "✅ Media identity resolution finished\n"
+            "⏳ Comparing with your existing collection…\n\n"
+            "Preparing a preview of new and updated records.\n"
+            "No import changes have been applied."
         )
 
         selective = await asyncio.to_thread(
@@ -444,9 +546,7 @@ async def receive_import_document(
             preview=None,
         )
 
-        await reply_personal_text(
-            update,
-            context,
+        await deliver(
             (
                 "Import rejected by Kokabiel's intake "
                 f"checks:\n\n{exc}\n\n"
@@ -475,9 +575,7 @@ async def receive_import_document(
             preview=None,
         )
 
-        await reply_personal_text(
-            update,
-            context,
+        await deliver(
             (
                 "TMDB could not resolve this import right now. "
                 "No database changes were made. You can retry "
@@ -510,9 +608,7 @@ async def receive_import_document(
             preview=None,
         )
 
-        await reply_personal_text(
-            update,
-            context,
+        await deliver(
             (
                 "Kokabiel could not build the import preview. "
                 "No database changes were made."
@@ -529,9 +625,7 @@ async def receive_import_document(
     # Keep the session non-actionable while delivering
     # its initial preview. The raw upload is already removed.
     try:
-        await reply_personal_text(
-            update,
-            context,
+        await deliver(
             format_import_preview(
                 preview
             ),

@@ -34,6 +34,24 @@ class SearchResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ReleaseEvent:
+    date: str
+    region: str
+    release_type: int
+
+    @property
+    def label(self) -> str:
+        return {
+            1: "Premiere",
+            2: "Limited theatrical",
+            3: "Theatrical",
+            4: "Digital",
+            5: "Physical media",
+            6: "Television",
+        }.get(self.release_type, "Other")
+
+
+@dataclass(frozen=True, slots=True)
 class SeasonSummary:
     season_number: int
     name: str
@@ -91,6 +109,27 @@ class MediaDetails:
     number_of_episodes: int = 0
     networks: tuple[str, ...] = ()
     seasons: tuple[SeasonSummary, ...] = ()
+    release_date: str | None = None
+    release_region: str | None = None
+    release_events: tuple[ReleaseEvent, ...] = ()
+    next_episode: EpisodeDetails | None = None
+
+    @property
+    def lifecycle_label(self) -> str:
+        if not self.is_series:
+            return self.tmdb_status or "Unknown"
+
+        status = (self.tmdb_status or "").strip().casefold()
+
+        return {
+            "returning series": "Continuing",
+            "ended": "Ended",
+            "canceled": "Canceled",
+            "cancelled": "Canceled",
+            "in production": "In production",
+            "planned": "Planned",
+            "pilot": "Pilot",
+        }.get(status, "Unknown")
 
     @property
     def short_type(self) -> str:
@@ -133,6 +172,30 @@ class PersonalEntry:
     viewing_status: ViewingStatus
     updated_at: str
     watched_episodes: int = 0
+    rating: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalLibraryPage:
+    entries: tuple[PersonalEntry, ...]
+    total: int
+    page: int
+    page_size: int
+
+    @property
+    def page_count(self) -> int:
+        return max(
+            1,
+            (self.total + self.page_size - 1) // self.page_size,
+        )
+
+    @property
+    def has_previous(self) -> bool:
+        return self.page > 0
+
+    @property
+    def has_next(self) -> bool:
+        return self.page + 1 < self.page_count
 
 
 @dataclass(frozen=True, slots=True)
