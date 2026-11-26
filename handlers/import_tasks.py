@@ -11,6 +11,7 @@ from handlers.common import (
     reply_personal_text,
     settings,
 )
+from handlers.import_access import private_import_identity
 from handlers.imports import (
     IMPORT_SESSION_KEY,
     PendingImport,
@@ -335,6 +336,24 @@ def _owned_session(update, context) -> PendingImport | None:
     return None
 
 
+def _private_import_candidate(update, context) -> bool:
+    if _private_owner(update, context):
+        return True
+
+    user_id = private_import_identity(update)
+
+    if user_id is None:
+        return False
+
+    pending = _owned_session(update, context)
+
+    return (
+        pending is not None
+        and pending.origin is not None
+        and pending.origin.user_id == user_id
+    )
+
+
 async def dispatch_import_command(
     update,
     context,
@@ -375,7 +394,7 @@ async def dispatch_import_document(
     handler,
 ) -> None:
 
-    if not _private_owner(update, context):
+    if not _private_import_candidate(update, context):
         await handler(update, context)
         return
 
@@ -426,7 +445,7 @@ async def dispatch_callback(
     if (
         query is None
         or not (query.data or "").startswith("imp|")
-        or not _private_owner(update, context)
+        or not _private_import_candidate(update, context)
     ):
         # All ordinary callbacks remain sequential.
         await handler(update, context)
@@ -459,6 +478,26 @@ async def dispatch_callback(
     preparation = (
         action == "prepare_verified"
         and pending.state == "ready"
+    ) or (
+        (
+            action == "history"
+            or action.startswith("history_")
+        )
+        and pending.state in {
+            "awaiting_upload",
+            "undo_history",
+            "undo_ready",
+        }
+    ) or (
+        action.startswith("undo_")
+        and action != "undo_apply"
+        and pending.state == "undo_history"
+    ) or (
+        action == "upload"
+        and pending.state in {
+            "undo_history",
+            "undo_ready",
+        }
     )
 
     writer = (
@@ -469,6 +508,10 @@ async def dispatch_callback(
         or (
             action == "apply_verified"
             and pending.state == "verified_ready"
+        )
+        or (
+            action == "undo_apply"
+            and pending.state == "undo_ready"
         )
     )
 

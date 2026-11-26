@@ -139,8 +139,8 @@ class ImportSessionBoundaryTests(
 
                     with patch.object(
                         workflow,
-                        "allowed",
-                        new=AsyncMock(return_value=True),
+                        "group_import_origin",
+                        new=AsyncMock(return_value=None),
                     ):
                         await workflow.import_command(
                             self.update(

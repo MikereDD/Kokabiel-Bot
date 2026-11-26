@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path, PurePosixPath
 from secrets import token_hex
+from time import monotonic
 from typing import Literal
 
 from telegram import (
@@ -15,6 +16,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
+from telegram.error import Forbidden, TelegramError
 from telegram.ext import ContextTypes
 
 from handlers.common import (
@@ -24,6 +26,19 @@ from handlers.common import (
     tmdb,
     user_identity,
 )
+from handlers.import_access import (
+    ImportOrigin,
+    group_import_origin,
+    private_import_identity,
+    verify_member_origin,
+)
+from imports.undo import (
+    ImportUndoPreview,
+    apply_import_undo,
+    list_import_batches,
+    preview_import_undo,
+)
+
 from imports.db_apply import (
     ImportApplyError,
     ImportBackupError,
@@ -66,6 +81,8 @@ ImportSessionState = Literal[
     "ready",
     "preparing_verified",
     "verified_ready",
+    "undo_history",
+    "undo_ready",
     "applying",
 ]
 
@@ -79,46 +96,235 @@ class PendingImport:
     state: ImportSessionState
     path: Path | None = None
     preview: ImportDatabasePreview | None = None
+    origin: ImportOrigin | None = None
+    expires_at: float | None = None
+    undo_preview: ImportUndoPreview | None = None
+
+
+IMPORT_ACTIVATION_KEY = "kokabiel_import_activation"
+IMPORT_ACTIVATION_TTL = 600
+MEMBER_IMPORT_SESSION_TTL = 86400
+
+MEMBER_IMPORT_PROMPT = (
+    "📥 <b>Import your tracker data</b>\n\n"
+    "Send your original tracker export as a "
+    "<code>.csv</code>, <code>.json</code>, or "
+    "<code>.zip</code> document.\n\n"
+    "Supported sources: Trakt, IMDb, Letterboxd, and Simkl.\n\n"
+    "Your import is private. Kokabiel will show a preview "
+    "before anything can be written."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ImportActivation:
+    token: str
+    origin: ImportOrigin
+    expires_at: float
+
+
+def _member_import_blocked(context, user_id: int) -> str | None:
+    from handlers.import_tasks import import_task_manager
+
+    manager = import_task_manager(context.application)
+
+    if not manager.accepting or not context.application.running:
+        return "Kokabiel is shutting down. Try again after restart."
+
+    pending = context.user_data.get(IMPORT_SESSION_KEY)
+
+    if manager.busy(user_id) or (
+        isinstance(pending, PendingImport)
+        and pending.state in {
+            "processing",
+            "preparing_verified",
+            "applying",
+        }
+    ):
+        return "An import operation is already in progress."
+
+    return None
+
+
+def _import_entry_keyboard(token: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📚 Import History",
+                callback_data=f"imp|history|{token}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Cancel Import",
+                callback_data=f"imp|cancel|{token}",
+            )
+        ],
+    ])
+
+
+async def _open_member_dm(
+    update,
+    context,
+    origin: ImportOrigin,
+    *,
+    allow_activation: bool,
+) -> None:
+    user_id, user_name = user_identity(update)
+
+    if origin.user_id != user_id:
+        return
+
+    blocked = _member_import_blocked(context, user_id)
+
+    if blocked:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=blocked,
+            )
+        except TelegramError:
+            pass
+        return
+
+    context.user_data.pop(IMPORT_ACTIVATION_KEY, None)
+
+    pending = PendingImport(
+        token=token_hex(16),
+        user_id=user_id,
+        user_name=user_name,
+        chat_id=user_id,
+        state="awaiting_upload",
+        origin=origin,
+        expires_at=monotonic() + MEMBER_IMPORT_SESSION_TTL,
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=MEMBER_IMPORT_PROMPT,
+            parse_mode="HTML",
+            reply_markup=_import_entry_keyboard(pending.token),
+        )
+
+    except Forbidden:
+        if not allow_activation:
+            return
+
+        activation = ImportActivation(
+            token=token_hex(16),
+            origin=origin,
+            expires_at=monotonic() + IMPORT_ACTIVATION_TTL,
+        )
+
+        context.user_data[IMPORT_ACTIVATION_KEY] = activation
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "Open private import",
+                url=(
+                    f"https://t.me/{context.bot.username}"
+                    f"?start=imp_{activation.token}"
+                ),
+            )
+        ]])
+
+        try:
+            await reply_personal_text(
+                update,
+                context,
+                "Open Kokabiel privately to continue.",
+                reply_markup=keyboard,
+            )
+        except TelegramError:
+            context.user_data.pop(IMPORT_ACTIVATION_KEY, None)
+
+        return
+
+    except TelegramError:
+        return
+
+    _discard_pending_import(context)
+    context.user_data[IMPORT_SESSION_KEY] = pending
+
+
+async def handle_member_import_start(update, context) -> bool:
+    """Consume only the import-specific /start payload."""
+
+    args = getattr(context, "args", None) or []
+
+    if not args or not args[0].startswith("imp_"):
+        return False
+
+    if len(args) != 1:
+        return True
+
+    user_id = private_import_identity(update)
+
+    if user_id is None:
+        return True
+
+    activation = context.user_data.get(IMPORT_ACTIVATION_KEY)
+
+    if not isinstance(activation, ImportActivation):
+        return True
+
+    if (
+        activation.origin.user_id != user_id
+        or args[0] != f"imp_{activation.token}"
+    ):
+        return True
+
+    if monotonic() >= activation.expires_at:
+        context.user_data.pop(IMPORT_ACTIVATION_KEY, None)
+        return True
+
+    context.user_data.pop(IMPORT_ACTIVATION_KEY, None)
+
+    if not await verify_member_origin(
+        context,
+        activation.origin,
+        user_id,
+    ):
+        return True
+
+    await _open_member_dm(
+        update,
+        context,
+        activation.origin,
+        allow_activation=False,
+    )
+
+    return True
 
 
 async def import_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    if not await allowed(
-        update,
-        context,
-    ):
-        return
-
     chat = update.effective_chat
     user = update.effective_user
 
     if chat is None or user is None:
         return
 
-    if chat.type in {
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    }:
-        await reply_personal_text(
-            update,
-            context,
-            (
-                "📥 <b>Import tracker data</b>\n\n"
-                "Tracker export uploads are not accepted in "
-                "group chats yet. Telegram can keep the "
-                "/import command private, but an ordinary "
-                "document uploaded by you to the group is not "
-                "a private bot upload.\n\n"
-                "Kokabiel will not ask you to expose your "
-                "watch history or ratings to the group."
-            ),
-            parse_mode="HTML",
-        )
+    if chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        origin = await group_import_origin(update, context)
+
+        if origin is not None:
+            await _open_member_dm(
+                update,
+                context,
+                origin,
+                allow_activation=True,
+            )
+
         return
 
     if chat.type != ChatType.PRIVATE:
+        return
+
+    if not await allowed(update, context):
         return
 
     current = context.user_data.get(
@@ -180,6 +386,7 @@ async def import_command(
             "anything can be written."
         ),
         parse_mode="HTML",
+        reply_markup=_import_entry_keyboard(pending.token),
     )
 
 
@@ -219,6 +426,130 @@ async def _run_import_worker(function, *args, **kwargs):
                 )
 
         raise
+
+
+def _member_session_expired(pending: PendingImport) -> bool:
+    return (
+        pending.origin is not None
+        and (
+            pending.expires_at is None
+            or not monotonic() < pending.expires_at
+        )
+    )
+
+
+def _discard_expired_member_session(context, pending) -> None:
+    # Never interfere with an admitted operation or its files.
+    if (
+        _member_session_expired(pending)
+        and pending.state in {
+            "awaiting_upload",
+            "ready",
+            "verified_ready",
+            "undo_history",
+            "undo_ready",
+        }
+        and context.user_data.get(IMPORT_SESSION_KEY) is pending
+    ):
+        _discard_pending_import(context)
+
+
+IMPORT_WRITER_BUSY = (
+    "An import is being applied. "
+    "Please try this action again shortly."
+)
+
+
+def _foreign_import_writer(context) -> bool:
+    from handlers.import_tasks import IMPORT_TASK_MANAGER_KEY
+
+    application = getattr(context, "application", None)
+    bot_data = getattr(application, "bot_data", {})
+    manager = bot_data.get(IMPORT_TASK_MANAGER_KEY)
+
+    return bool(
+        manager is not None
+        and manager.writer_count
+        and not manager.is_current_writer()
+    )
+
+
+async def _session_import_allowed(
+    update,
+    context,
+    pending: PendingImport,
+) -> Literal["allowed", "busy", "denied"]:
+    """Distinguish authorization from transient writer contention."""
+
+    if pending.origin is None:
+        if _foreign_import_writer(context):
+            return "busy"
+
+        authorized = await allowed(update, context)
+
+        if not authorized:
+            return "denied"
+
+        return (
+            "busy"
+            if _foreign_import_writer(context)
+            else "allowed"
+        )
+
+    user_id = private_import_identity(update)
+
+    if (
+        user_id is None
+        or pending.user_id != user_id
+        or pending.chat_id != user_id
+        or pending.origin.user_id != user_id
+    ):
+        return "denied"
+
+    if _member_session_expired(pending):
+        _discard_expired_member_session(context, pending)
+        return "denied"
+
+    if not await verify_member_origin(
+        context,
+        pending.origin,
+        user_id,
+    ):
+        return "denied"
+
+    if _member_session_expired(pending):
+        _discard_expired_member_session(context, pending)
+        return "denied"
+
+    return (
+        "busy"
+        if _foreign_import_writer(context)
+        else "allowed"
+    )
+
+
+async def _restore_busy_import_session(
+    context,
+    active: PendingImport,
+    original: PendingImport,
+) -> None:
+    """Restore the original session without changing its token."""
+
+    if context.user_data.get(IMPORT_SESSION_KEY) is not active:
+        return
+
+    context.user_data[IMPORT_SESSION_KEY] = original
+
+    # Do not edit the original message: its existing keyboard
+    # remains valid and can be retried after the writer finishes.
+
+    try:
+        await context.bot.send_message(
+            chat_id=original.chat_id,
+            text=IMPORT_WRITER_BUSY,
+        )
+    except TelegramError:
+        pass
 
 
 async def receive_import_document(
@@ -265,10 +596,19 @@ async def receive_import_document(
     ):
         return
 
-    if not await allowed(
+    access = await _session_import_allowed(
         update,
         context,
-    ):
+        pending,
+    )
+
+    if access == "busy":
+        await update.effective_message.reply_text(
+            IMPORT_WRITER_BUSY
+        )
+        return
+
+    if access != "allowed":
         return
 
     if context.user_data.get(
@@ -731,6 +1071,423 @@ async def _edit_import_message_safely(
         )
 
 
+async def _handle_undo_action(
+    update,
+    context,
+    pending: PendingImport,
+    action: str,
+) -> bool:
+    """Handle history and undo within the authorized import session."""
+
+    history = (
+        action == "history"
+        or action.startswith("history_")
+    )
+
+    selection = (
+        action.startswith("undo_")
+        and action != "undo_apply"
+    )
+
+    applying = action == "undo_apply"
+    returning = action == "upload"
+
+    if not (history or selection or applying or returning):
+        return False
+
+    query = update.callback_query
+
+    valid = (
+        history
+        and pending.state in {
+            "awaiting_upload",
+            "undo_history",
+            "undo_ready",
+        }
+    ) or (
+        returning
+        and pending.state in {
+            "undo_history",
+            "undo_ready",
+        }
+    ) or (
+        selection
+        and pending.state == "undo_history"
+    ) or (
+        applying
+        and pending.state == "undo_ready"
+        and isinstance(
+            pending.undo_preview,
+            ImportUndoPreview,
+        )
+        and pending.undo_preview.user_id == pending.user_id
+        and bool(pending.undo_preview.eligible)
+    )
+
+    if not valid:
+        await query.answer(
+            "That import action is no longer available.",
+            show_alert=True,
+        )
+        return True
+
+    from handlers.import_tasks import import_task_manager
+
+    manager = import_task_manager(context.application)
+
+    if applying and not manager.is_current_writer():
+        await query.answer(
+            "Undo requires a supervised writer.",
+            show_alert=True,
+        )
+        return True
+
+    number = None
+
+    if selection or action.startswith("history_"):
+        raw = action.split("_", 1)[1]
+
+        if (
+            not raw.isascii()
+            or not raw.isdecimal()
+            or len(raw) > 19
+            or not 0 < int(raw) <= 9223372036854775807
+        ):
+            await query.answer(
+                "Invalid import selection.",
+                show_alert=True,
+            )
+            return True
+
+        number = int(raw)
+
+    active = replace(
+        pending,
+        state="applying" if applying else "processing",
+    )
+
+    context.user_data[IMPORT_SESSION_KEY] = active
+
+    try:
+        await query.answer(
+            "Applying approved undo..."
+            if applying
+            else "Loading import history..."
+        )
+
+        # Membership and ownership are checked again after the
+        # acknowledgement and before database access.
+
+        authorized = await _session_import_allowed(
+            update,
+            context,
+            active,
+        )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not active:
+            return True
+
+        if authorized == "busy":
+            await _restore_busy_import_session(
+                context, active, pending
+            )
+            return True
+
+        if authorized != "allowed":
+            _discard_pending_import(context)
+
+            await _edit_import_message_safely(
+                query,
+                "Import authorization is unavailable. "
+                "Request /import again.",
+            )
+            return True
+
+        database_path = settings(context).database_path
+
+        if applying:
+            backup = _backup_path(
+                database_path,
+                active.user_id,
+                active.token,
+            ).with_name(
+                f"preundo-{active.token}.db"
+            )
+
+            _prepare_backup_directory(backup.parent)
+
+            result = await _run_import_worker(
+                apply_import_undo,
+                active.undo_preview,
+                database_path=database_path,
+                backup_path=backup,
+            )
+
+            if context.user_data.get(
+                IMPORT_SESSION_KEY
+            ) is active:
+                _discard_pending_import(context)
+
+                await _edit_import_message_safely(
+                    query,
+                    (
+                        f"✅ Import #{result.batch_id} — Undo complete\n\n"
+                        f"Titles restored: {result.restored_count}\n"
+                        f"Titles retained: {result.skipped_count}\n\n"
+                        "Other members' records and shared media "
+                        "metadata were preserved."
+                    ),
+                )
+
+            return True
+
+        token = token_hex(16)
+
+        if returning:
+            next_session = replace(
+                active,
+                token=token,
+                state="awaiting_upload",
+                preview=None,
+                undo_preview=None,
+            )
+
+            await query.edit_message_text(
+                MEMBER_IMPORT_PROMPT,
+                parse_mode="HTML",
+                reply_markup=_import_entry_keyboard(token),
+            )
+
+            if context.user_data.get(
+                IMPORT_SESSION_KEY
+            ) is active:
+                context.user_data[
+                    IMPORT_SESSION_KEY
+                ] = next_session
+
+            return True
+
+        if history:
+            rows = await _run_import_worker(
+                list_import_batches,
+                database_path,
+                user_id=active.user_id,
+                before_id=number,
+            )
+
+            buttons = []
+
+            for batch_id, tracker, created_at, count in rows[:8]:
+                buttons.append([
+                    InlineKeyboardButton(
+                        (
+                            f"#{batch_id} · {tracker[:20]} · "
+                            f"{created_at[:10]} · {count} titles"
+                        ),
+                        callback_data=f"imp|undo_{batch_id}|{token}",
+                    )
+                ])
+
+            if len(rows) > 8:
+                buttons.append([
+                    InlineKeyboardButton(
+                        "Older imports",
+                        callback_data=(
+                            f"imp|history_{rows[7][0]}|{token}"
+                        ),
+                    )
+                ])
+
+            if number is not None:
+                buttons.append([
+                    InlineKeyboardButton(
+                        "Newest imports",
+                        callback_data=f"imp|history|{token}",
+                    )
+                ])
+
+            text = (
+                "📚 Your import history\n\n"
+                "Select a completed import to preview its undo.\n"
+                "Previously modified titles will be preserved.\n\n"
+                "Imports made before journal support cannot "
+                "be automatically reversed."
+            )
+
+            if not rows:
+                text += "\n\nNo available import batches."
+
+            next_session = replace(
+                active,
+                token=token,
+                state="undo_history",
+                preview=None,
+                undo_preview=None,
+            )
+
+        else:
+            plan = await _run_import_worker(
+                preview_import_undo,
+                database_path,
+                user_id=active.user_id,
+                batch_id=number,
+            )
+
+            if plan.user_id != active.user_id:
+                raise RuntimeError(
+                    "Undo preview identity mismatch."
+                )
+
+            text = (
+                f"⚠️ Undo import #{plan.batch_id}\n\n"
+                f"Source: {plan.source}\n"
+                f"Imported: {plan.created_at}\n\n"
+                f"Titles to restore: {plan.restore_count}\n"
+                f"Titles to retain: {plan.skipped_count}\n\n"
+                "Eligible titles will return to their pre-import "
+                "personal state. Titles modified afterward will "
+                "remain unchanged.\n\n"
+                "Confirmation is required."
+            )
+
+            buttons = []
+
+            if plan.eligible:
+                buttons.append([
+                    InlineKeyboardButton(
+                        "Confirm Undo",
+                        callback_data=f"imp|undo_apply|{token}",
+                    )
+                ])
+            else:
+                text += "\n\nNothing can be safely undone."
+
+            buttons.append([
+                InlineKeyboardButton(
+                    "Back to Import History",
+                    callback_data=f"imp|history|{token}",
+                )
+            ])
+
+            next_session = replace(
+                active,
+                token=token,
+                state="undo_ready",
+                preview=None,
+                undo_preview=plan,
+            )
+
+        buttons.append([
+            InlineKeyboardButton(
+                "Back to Upload",
+                callback_data=f"imp|upload|{token}",
+            )
+        ])
+
+        buttons.append([
+            InlineKeyboardButton(
+                "Cancel",
+                callback_data=f"imp|cancel|{token}",
+            )
+        ])
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is not active:
+            return True
+
+        if _member_session_expired(active):
+            _discard_pending_import(context)
+
+            await _edit_import_message_safely(
+                query,
+                "Import session expired. Request /import again.",
+            )
+            return True
+
+        if _foreign_import_writer(context):
+            await _restore_busy_import_session(
+                context, active, pending
+            )
+            return True
+
+        if active.origin is not None:
+            authorized = await _session_import_allowed(
+                update,
+                context,
+                active,
+            )
+
+            if context.user_data.get(
+                IMPORT_SESSION_KEY
+            ) is not active:
+                return True
+
+            if authorized == "busy":
+                await _restore_busy_import_session(
+                    context, active, pending
+                )
+                return True
+
+            if authorized != "allowed":
+                _discard_pending_import(context)
+
+                await _edit_import_message_safely(
+                    query,
+                    "Import authorization is unavailable. "
+                    "Request /import again.",
+                )
+                return True
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is active:
+            context.user_data[
+                IMPORT_SESSION_KEY
+            ] = next_session
+
+    except asyncio.CancelledError:
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is active:
+            _discard_pending_import(context)
+
+        raise
+
+    except Exception as exc:
+        LOGGER.warning(
+            "Import management failed for user %s (%s)",
+            pending.user_id,
+            type(exc).__name__,
+        )
+
+        if context.user_data.get(
+            IMPORT_SESSION_KEY
+        ) is active:
+            _discard_pending_import(context)
+
+            await _edit_import_message_safely(
+                query,
+                (
+                    "Kokabiel could not verify that the undo "
+                    "completed normally. Request /import again "
+                    "to inspect the current history."
+                    if applying
+                    else "Import history could not be loaded. "
+                    "Request /import again."
+                ),
+            )
+
+    return True
+
+
 async def import_callback_router(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -752,12 +1509,6 @@ async def import_callback_router(
             "That import action is no longer valid.",
             show_alert=True,
         )
-        return
-
-    if not await allowed(
-        update,
-        context,
-    ):
         return
 
     chat = update.effective_chat
@@ -796,6 +1547,79 @@ async def import_callback_router(
         )
         return
 
+    if action == "cancel":
+        from handlers.import_tasks import IMPORT_TASK_MANAGER_KEY
+
+        application = getattr(context, "application", None)
+        manager = getattr(
+            application, "bot_data", {}
+        ).get(IMPORT_TASK_MANAGER_KEY)
+
+        if (
+            private_import_identity(update) != pending.user_id
+            or (
+                pending.origin is not None
+                and pending.origin.user_id != pending.user_id
+            )
+        ):
+            await query.answer(
+                "That import session is unavailable.",
+                show_alert=True,
+            )
+            return
+
+        if pending.state in {
+            "processing",
+            "preparing_verified",
+            "applying",
+        } or (
+            manager is not None
+            and manager.busy(pending.user_id)
+        ):
+            await query.answer(
+                "An import operation is already in progress.",
+                show_alert=True,
+            )
+            return
+
+        _discard_pending_import(context)
+
+        await query.answer("Import cancelled.")
+
+        await query.edit_message_text(
+            "Import cancelled. No changes were requested."
+        )
+        return
+
+    access = await _session_import_allowed(
+        update,
+        context,
+        pending,
+    )
+
+    if access == "busy":
+        await query.answer(
+            IMPORT_WRITER_BUSY,
+            show_alert=True,
+        )
+        return
+
+    if access != "allowed":
+        if pending.origin is not None:
+            await query.answer(
+                "Import authorization is unavailable. "
+                "Request /import again in your authorized group.",
+                show_alert=True,
+            )
+        return
+
+    if context.user_data.get(IMPORT_SESSION_KEY) is not pending:
+        await query.answer(
+            "That import session has changed.",
+            show_alert=True,
+        )
+        return
+
     if pending.state in {
         "processing",
         "preparing_verified",
@@ -807,18 +1631,12 @@ async def import_callback_router(
         )
         return
 
-    if action == "cancel":
-        _discard_pending_import(
-            context
-        )
-
-        await query.answer(
-            "Import cancelled."
-        )
-
-        await query.edit_message_text(
-            "Import cancelled. No changes were requested."
-        )
+    if await _handle_undo_action(
+        update,
+        context,
+        pending,
+        action,
+    ):
         return
 
     if (
@@ -1082,6 +1900,36 @@ async def import_callback_router(
         return
 
     try:
+        if applying.origin is not None:
+            from handlers.import_tasks import import_task_manager
+
+            manager = import_task_manager(context.application)
+
+            authorized = (
+                manager.is_current_writer()
+                and (
+                    await _session_import_allowed(
+                        update,
+                        context,
+                        applying,
+                    )
+                ) == "allowed"
+            )
+
+            if context.user_data.get(IMPORT_SESSION_KEY) is not applying:
+                return
+
+            if not authorized:
+                _discard_pending_import(context)
+
+                await _edit_import_message_safely(
+                    query,
+                    "Import authorization could not be verified. "
+                    "No import changes were made. "
+                    "Request /import again in your authorized group.",
+                )
+                return
+
         try:
             current_settings = settings(
                 context
@@ -1117,6 +1965,11 @@ async def import_callback_router(
             backup_path=backup_path,
             user_name=pending.user_name,
             chat_id=pending.chat_id,
+            **(
+                {"origin_group_id": pending.origin.group_id}
+                if pending.origin is not None
+                else {}
+            ),
         )
 
     except asyncio.CancelledError:

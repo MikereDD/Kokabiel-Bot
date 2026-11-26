@@ -10,6 +10,11 @@ from contextlib import closing
 from pathlib import Path
 from typing import TypeVar
 
+from imports.journal import (
+    JOURNAL_SCHEMA,
+    install_journal_schema,
+)
+
 from release_intelligence import (
     ReleaseCandidate,
     ReleaseSnapshot,
@@ -188,6 +193,9 @@ ON suggestions(chat_id, suggested_at);
 """
 
 
+SCHEMA += JOURNAL_SCHEMA
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -205,6 +213,7 @@ class Database:
             self._migrate_recommendations(connection)
             self._migrate_global_user_state(connection)
             self._ensure_indexes(connection)
+            install_journal_schema(connection)
             connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -629,7 +638,24 @@ class Database:
 
         def operation(connection: sqlite3.Connection) -> UserMediaState:
             self._upsert_media(connection, details)
-            self._ensure_user_state(connection, chat_id, details, user_id, user_name)
+            existing = connection.execute(
+                """
+                SELECT viewing_status, watchlist
+                FROM user_media_state
+                WHERE user_id = ?
+                  AND media_type = 'tv' AND tmdb_id = ?
+                """,
+                (user_id, details.tmdb_id),
+            ).fetchone()
+
+            if existing is None:
+                self._ensure_user_state(
+                    connection,
+                    chat_id,
+                    details,
+                    user_id,
+                    user_name,
+                )
             rows = connection.execute(
                 """
                 SELECT season_number, episode_number
@@ -660,6 +686,10 @@ class Database:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE user_id = ?
                   AND media_type = 'tv' AND tmdb_id = ?
+                  AND (
+                      viewing_status != ?
+                      OR (? != 'none' AND watchlist != 0)
+                  )
                 """,
                 (
                     status,
@@ -668,6 +698,8 @@ class Database:
                     chat_id,
                     user_id,
                     details.tmdb_id,
+                    status,
+                    status,
                 ),
             )
             row = connection.execute(

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.1 — 2026-11-25
+
+### Added
+
+- Private tracker imports initiated by members of explicitly authorized groups.
+- Current Telegram membership verification and user-bound private activation.
+- Expiring member import sessions without general private-command access.
+- Private import history, pagination, cancellation, and return-to-upload navigation.
+- Persistent import journals containing exact personal before-and-after records.
+- Transactional undo with explicit confirmation and verified database backups.
+- Partial undo that preserves titles modified after import.
+
+### Fixed
+
+- Preserve valid import sessions during competing database writes.
+- Provide retry feedback instead of misleading authorization failures.
+- Permit identity-bound cancellation of idle import sessions.
+- Preserve undo eligibility when viewing unchanged television progress.
+- Retain journal invalidation when personal viewing state genuinely changes.
+
+### Security and integrity
+
+- Keep member import authorization separate from owner privileges.
+- Serialize import and undo database writers.
+- Reject stale approvals and cross-user batch access.
+- Preserve shared metadata and unrelated members' personal records.
+- Add journal tables, triggers, and indexes without rewriting existing records.
+
+### Compatibility
+
+- Existing owner-private import access remains supported.
+- Existing tracker formats and selective import approval remain supported.
+- Imports completed before journal support cannot be automatically undone.
+- Member imports require verifiable membership in an explicitly allowed group.
+
 ## 0.2.0 — 2026-11-25
 
 ### Personal Media Library and Release Intelligence

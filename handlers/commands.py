@@ -53,7 +53,7 @@ HELP_TEXT = """<b>Kokabiel commands</b>
 /watched — show your watched, caught-up, and completed titles
 /myprogress — show your film, TV, and documentary progress
 /mysuggestions — show titles you suggested to this group
-/import — import tracker data; export uploads are accepted only in a private chat
+/import — privately import tracker data, view import history, or undo an import
 
 <b>Group</b>
 /watchlist — show titles members saved to their watchlists

@@ -16,6 +16,10 @@ from imports.db_preview import (
     snapshot_from_connection,
 )
 from imports.resolve import ResolutionPreview
+from imports.journal import (
+    capture_personal_titles,
+    record_completed_import,
+)
 
 
 BACKUP_DEADLINE_SECONDS = 30.0
@@ -66,6 +70,7 @@ def apply_database_import(
     backup_path: str | Path,
     user_name: str,
     chat_id: int | None = None,
+    origin_group_id: int | None = None,
 ) -> ImportApplyResult:
     """
     Apply one previously approved import preview transactionally.
@@ -80,6 +85,12 @@ def apply_database_import(
     - the entire transaction rolls back on failure;
     - replaying an already-applied preview is a safe no-op.
     """
+
+    if origin_group_id is not None:
+        if type(origin_group_id) is not int or origin_group_id >= 0:
+            raise ValueError("Invalid import originating group.")
+
+        chat_id = origin_group_id
 
     database = Path(
         database_path
@@ -248,6 +259,11 @@ def apply_database_import(
             backup_identity,
         )
 
+        journal_before = capture_personal_titles(
+            connection,
+            approved.user_id,
+        )
+
         mutation_started = True
 
         for item in approved.items:
@@ -258,6 +274,24 @@ def apply_database_import(
                 chat_id,
                 item,
                 counts,
+            )
+
+        if origin_group_id is not None:
+            connection.execute(
+                '''
+                INSERT INTO user_chats (
+                    chat_id, user_id, user_name
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, user_id)
+                DO UPDATE SET
+                    user_name = excluded.user_name,
+                    last_seen_at = CURRENT_TIMESTAMP
+                ''',
+                (
+                    origin_group_id,
+                    approved.user_id,
+                    user_name,
+                ),
             )
 
         foreign_key_errors = (
@@ -312,6 +346,18 @@ def apply_database_import(
             raise ImportVerificationError(
                 "Transaction result does not match the approved preview."
             )
+
+        record_completed_import(
+            connection,
+            user_id=approved.user_id,
+            source=approved.source,
+            origin_group_id=origin_group_id,
+            before=journal_before,
+            after=capture_personal_titles(
+                connection,
+                approved.user_id,
+            ),
+        )
 
         connection.commit()
         committed = True

@@ -4,7 +4,7 @@
 
 # Kokabiel
 
-[![Version](https://img.shields.io/badge/version-0.2.0--dev-gold)](https://github.com/MikereDD/Kokabiel-Bot/releases)
+[![Version](https://img.shields.io/badge/version-0.2.1-gold)](https://github.com/MikereDD/Kokabiel-Bot/releases)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Telegram-26A5E4)
 ![Library](https://img.shields.io/badge/python--telegram--bot-22.x-blue)
@@ -16,9 +16,9 @@
 
 **Command-driven discovery · Personal progress · Group watchlists · TMDB-powered metadata**
 
-**Current version: `v0.2.0`**
+**Current version: `v0.2.1`**
 
-[Release notes](docs/releases/v0.2.0.md)
+[Release notes](docs/releases/v0.2.1.md)
 
 </div>
 
@@ -37,8 +37,9 @@ production, and interacts with Kokabiel through explicit controls.
 - Disambiguate remakes and same-name productions before posting a card.
 - Media-aware cards distinguish films, documentary films, TV series, limited
   series, documentary series, and documentary limited series.
-- Personal watchlists, ratings, watched status, and episode progress are scoped
-  to both Telegram chat ID and user ID.
+- Personal watchlists, ratings, watched status, and episode progress are
+  scoped globally to each Telegram user. Group associations determine
+  participation in group aggregates.
 - Group watchlists aggregate members' personal selections without erasing
   individual ownership.
 - Group suggestions combine duplicate titles while preserving who suggested
@@ -51,6 +52,9 @@ production, and interacts with Kokabiel through explicit controls.
 - Native tracker imports from IMDb, Letterboxd, Trakt, and Simkl.
 - Reviewable import previews and selective approval of verified records.
 - Transactional imports with verified pre-import database backups.
+- Private tracker imports for members of authorized groups.
+- User-scoped import history and transactional undo.
+- Conservative preservation of personal records modified after import.
 
 ## Commands
 
@@ -59,7 +63,7 @@ production, and interacts with Kokabiel through explicit controls.
 | Discovery | `/movie <title>` · `/tv <title>` · `/documentary <title>` · `/search <title>` · `/random` |
 | Personal | `/mywatchlist` · `/watched` · `/myprogress` · `/mysuggestions` |
 | Group | `/watchlist` · `/suggestions` |
-| Imports | `/import` (authorized private chat) |
+| Imports | `/import` (authorized group or owner-private chat) |
 | General | `/about` · `/help` |
 | Owner | `/adminhelp` · `/whoami` · `/groups` · `/leave` · `/leavechat <chat_id>` · `/status` · `/reload` · `/restart` · `/shutdown` |
 
@@ -68,8 +72,18 @@ commands are restricted to Kokabiel's private chat.
 
 ## Tracker imports
 
-Use `/import` in an authorized private chat with Kokabiel,
-then upload a supported native tracker export.
+Members of an explicitly configured authorized group can use
+`/import` in that group. Kokabiel opens a private import session
+with the requesting member.
+
+Owners can also initiate imports directly in their private chat.
+
+All export uploads, previews, confirmations, progress messages,
+and results are handled privately. If Kokabiel cannot initiate
+a DM, it attempts to provide a user-bound, single-use activation
+link through its private in-group response mechanism.
+
+Ordinary members do not receive general private-command access.
 
 Kokabiel prepares a preview before applying imported personal
 watchlists, watched states, ratings, and supported episode history.
@@ -83,6 +97,28 @@ assuming that source episode numbers match TMDB.
 
 See [Selective Tracker Import Approval](docs/import-selective-approval.md)
 for the workflow, safeguards, and limitations.
+
+### Import history and undo
+
+The private import prompt includes **Import History** and
+**Cancel Import** controls.
+
+Choose a journaled import to preview the number of titles that
+can be restored and the number that must be retained.
+
+- Undo requires explicit confirmation and a verified database backup.
+- Only the requesting user's eligible personal records are restored.
+- Subsequent changes to an imported title invalidate automatic undo
+  eligibility for that title.
+- Shared media metadata and other users' records are preserved.
+- Older imports made before journal support cannot be automatically undone.
+- A completed partial undo closes its batch and preserves skipped titles.
+
+Cancellation discards the unfinished session. It does not erase
+previously committed library data.
+
+See [Private Member Imports](docs/private-member-imports.md)
+for access requirements and operational limitations.
 
 ## Privacy model
 
@@ -98,7 +134,10 @@ Keep **Privacy Mode enabled** in BotFather:
 4. Choose **Enable**.
 
 Kokabiel does not require Telegram administrator status for its normal feature
-set.
+set. Member imports additionally require successful verification of the
+requesting user's current group membership. Telegram only guarantees
+membership lookup for other users when the bot is a group administrator.
+If verification is unavailable, member imports are denied.
 
 ## Supported runtime
 

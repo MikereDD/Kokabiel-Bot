@@ -38,6 +38,7 @@ from handlers.commands import (
 from handlers.errors import error_handler
 from handlers.imports import (
     import_command,
+    handle_member_import_start,
     receive_import_document,
 )
 from handlers.import_tasks import (
@@ -145,6 +146,13 @@ async def post_stop(application: Application) -> None:
     await import_task_manager(application).drain()
 
 
+async def _dispatch_start(update, context) -> None:
+    if await handle_member_import_start(update, context):
+        return
+
+    await start(update, context)
+
+
 async def _dispatch_import_command(update, context) -> None:
     await dispatch_import_command(
         update,
@@ -200,7 +208,7 @@ def build_application() -> Application:
     application.bot_data["settings"] = settings
     application.bot_data["database"] = Database(settings.database_path)
 
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start", _dispatch_start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("about", about))
     application.add_handler(CommandHandler("movie", movie))

@@ -221,53 +221,34 @@ class ImportTelegramWorkflowTests(
 class ImportTelegramWorkflowAsyncTests(
     unittest.IsolatedAsyncioTestCase
 ):
-    async def test_group_import_does_not_arm_document_upload(self):
-        context = SimpleNamespace(
-            user_data={}
-        )
+    async def test_unauthorized_group_does_not_arm_import(self):
+        context = SimpleNamespace(user_data={})
 
         update = SimpleNamespace(
             effective_chat=SimpleNamespace(
                 id=-100123,
                 type=ChatType.SUPERGROUP,
             ),
-            effective_user=SimpleNamespace(
-                id=123,
-                full_name="Mike",
-                username=None,
-            ),
+            effective_user=SimpleNamespace(id=123),
         )
-
-        reply = AsyncMock()
 
         with (
             patch(
-                "handlers.imports.allowed",
-                new=AsyncMock(
-                    return_value=True
-                ),
+                "handlers.imports.group_import_origin",
+                new=AsyncMock(return_value=None),
             ),
             patch(
                 "handlers.imports.reply_personal_text",
-                new=reply,
-            ),
+                new=AsyncMock(),
+            ) as reply,
         ):
-            await import_command(
-                update,
-                context,
-            )
+            await import_command(update, context)
 
         self.assertNotIn(
             IMPORT_SESSION_KEY,
             context.user_data,
         )
-
-        reply.assert_awaited_once()
-
-        self.assertIn(
-            "not accepted in group chats",
-            reply.await_args.args[2],
-        )
+        reply.assert_not_awaited()
 
     async def test_private_import_arms_upload_session(self):
         context = SimpleNamespace(
